@@ -1,0 +1,18 @@
+{
+  "AGILAB Header": {
+    "scope": "python",
+    "prefix": "agi-header",
+    "body": [
+      "\"\"\"",
+      "Module: ${1:ModuleName}",
+      "Stage: ${2|Library,Notebook,Script|}",
+      "Author: ${3:StudentName}",
+      "Date: ${CURRENT_YEAR}-${CURRENT_MONTH}-${CURRENT_DATE}",
+      "Description: ${4:ShortDescription}",
+      "\"\"\"",
+      "",
+      "$0"
+    ],
+    "description": "AGILAB 標準檔案標頭"
+  }
+}
