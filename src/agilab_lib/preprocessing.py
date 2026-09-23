@@ -447,4 +447,14 @@ def build_feature_matrices(
     full_feature_matrix = pd.concat([scaled_cont_df, encoded_cat_df], axis=1)
     full_feature_matrix[LABEL_COLUMN] = target.values
 
+    # Derive landmark 1-year mortality target
+    if "死亡日期" in df.columns and "year" in df.columns:
+        death_date = pd.to_datetime(df["死亡日期"], errors="coerce")
+        death_year = death_date.dt.year
+        baseline_year = df["year"]
+        is_death_1yr = ((death_year <= baseline_year + 1) & death_date.notna()).astype(
+            int
+        )
+        full_feature_matrix["is_death_1yr"] = is_death_1yr.values
+
     return scaled_cont_df, full_feature_matrix, target
