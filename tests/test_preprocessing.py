@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 import pytest
+
 from agilab_lib.analysis import fit_pca
 from agilab_lib.preprocessing import (
     HIGH_MISSING_DROPS,
