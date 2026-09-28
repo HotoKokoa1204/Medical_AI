@@ -1,8 +1,8 @@
-"""Publication-grade visualization utilities for PCA and clinical distributions.
-
-Follows AGILAB coding standards, rendering publication-ready figures (300 DPI)
-for Scree plots, PC1 vs PC2 outcome-colored scatter plots with confidence ellipses,
-and top feature loadings biplots.
+"""Module: visualization
+Stage: Library
+Author: KafuuChino
+Date: 2026-09-28
+Description: Publication-grade visualization utilities for PCA and clinical data.
 """
 
 from __future__ import annotations
@@ -144,18 +144,17 @@ def _draw_confidence_ellipse(
     if len(x) < 3:
         return
     cov = np.cov(x, y)
-    mean_x = np.mean(x)
-    mean_y = np.mean(y)
+    mean_x = float(np.mean(x))
+    mean_y = float(np.mean(y))
 
     vals, vecs = np.linalg.eigh(cov)
     order = vals.argsort()[::-1]
     vals, vecs = vals[order], vecs[:, order]
-    theta = np.degrees(np.arctan2(*vecs[:, 0][::-1]))
+    theta = float(np.degrees(np.arctan2(*vecs[:, 0][::-1])))
 
-    # 95% confidence chi-squared value for 2 d.o.f.
-    crit = np.sqrt(chi2.ppf(0.95, df=2))
-    width = 2 * crit * np.sqrt(max(vals[0], 0.0))
-    height = 2 * crit * np.sqrt(max(vals[1], 0.0))
+    crit = float(np.sqrt(chi2.ppf(0.95, df=2)))
+    width = float(2 * crit * np.sqrt(max(vals[0], 0.0)))
+    height = float(2 * crit * np.sqrt(max(vals[1], 0.0)))
 
     ellipse = patches.Ellipse(
         xy=(mean_x, mean_y),
@@ -177,8 +176,9 @@ def plot_pca_scatter(
     pca: PCA | None = None,
     save_path: Path | str | None = None,
     dpi: int = 300,
+    target_name: str = "3-Year Mortality",
 ) -> plt.Figure:
-    """Plot PC1 vs PC2 scatter plot colored by outcome label (is_death).
+    """Plot PC1 vs PC2 scatter plot colored by outcome label.
 
     Features 95% confidence ellipses, mean centroids, and variance labels.
 
@@ -188,6 +188,7 @@ def plot_pca_scatter(
         pca: Optional fitted PCA model to display variance percentages.
         save_path: Optional path to save the output image.
         dpi: Output image resolution (default 300).
+        target_name: Name of target outcome for title and legend.
 
     Returns:
         matplotlib.pyplot.Figure object.
@@ -217,7 +218,7 @@ def plot_pca_scatter(
         alpha=0.55,
         s=28,
         edgecolors="none",
-        label=f"Survived / Alive (n={np.sum(alive_mask)})",
+        label=f"Survived / Alive (n={int(np.sum(alive_mask))})",
     )
     ax.scatter(
         pc1[death_mask],
@@ -226,7 +227,7 @@ def plot_pca_scatter(
         alpha=0.65,
         s=32,
         edgecolors="none",
-        label=f"Deceased (n={np.sum(death_mask)})",
+        label=f"Deceased (n={int(np.sum(death_mask))})",
     )
 
     _draw_confidence_ellipse(
@@ -282,7 +283,7 @@ def plot_pca_scatter(
         fontweight="bold",
     )
     ax.set_title(
-        "Hemodialysis Baseline Cohort: PCA Space (Colored by is_death)",
+        f"Hemodialysis Cohort: PCA Space (Colored by {target_name})",
         fontsize=13,
         fontweight="bold",
         pad=12,
@@ -354,7 +355,6 @@ def plot_pca_loadings_biplot(
         tx = x * 1.15
         ty = y * 1.15
 
-        # Avoid text collisions between close vectors
         for px, py in placed_positions:
             if np.hypot(tx - px, ty - py) < 0.05:
                 ty += 0.038
@@ -437,11 +437,130 @@ def plot_pca_loadings_biplot(
     ax2.grid(axis="x", linestyle="--", alpha=0.3)
 
     plt.suptitle(
-        "PCA Loadings and Feature Vectors (Kidit Hemodialysis Baseline)",
+        "PCA Loadings and Feature Vectors (Kidit Hemodialysis Dynamic Cohort)",
         fontsize=13,
         fontweight="bold",
         y=0.98,
     )
+    fig.tight_layout()
+
+    if save_path is not None:
+        p = Path(save_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(p, dpi=dpi, bbox_inches="tight")
+
+    return fig
+
+
+def plot_t2_vs_spe(
+    t2: np.ndarray | pd.Series,
+    spe: np.ndarray | pd.Series,
+    t2_limit: float,
+    spe_limit: float,
+    save_path: Path | str | None = None,
+    dpi: int = 300,
+) -> plt.Figure:
+    """Plot Hotelling's T^2 vs SPE outlier scatter plot with 99% control limits.
+
+    Args:
+        t2: Array or Series of Hotelling's T^2 values.
+        spe: Array or Series of SPE (Q-statistic) values.
+        t2_limit: Theoretical upper control limit for T^2.
+        spe_limit: Theoretical upper control limit for SPE.
+        save_path: Optional path to save the output figure image.
+        dpi: Output image resolution (default 300).
+
+    Returns:
+        matplotlib.pyplot.Figure object.
+    """
+    t2_arr = np.asarray(t2)
+    spe_arr = np.asarray(spe)
+
+    outliers = (t2_arr > t2_limit) | (spe_arr > spe_limit)
+    inliers = ~outliers
+
+    n_total = len(t2_arr)
+    n_out = int(np.sum(outliers))
+    pct_out = (n_out / n_total) * 100.0 if n_total > 0 else 0.0
+
+    fig, ax = plt.subplots(figsize=(8.5, 6.5), dpi=dpi)
+
+    ax.scatter(
+        t2_arr[inliers],
+        spe_arr[inliers],
+        c="#2b5c8f",
+        alpha=0.55,
+        s=26,
+        edgecolors="none",
+        label=f"Normal Inliers (n={int(np.sum(inliers))})",
+    )
+    ax.scatter(
+        t2_arr[outliers],
+        spe_arr[outliers],
+        c="#e53e3e",
+        alpha=0.75,
+        s=34,
+        edgecolors="#9b2c2c",
+        linewidths=0.5,
+        label=f"Statistical Outliers (n={n_out}, {pct_out:.2f}%)",
+    )
+
+    # Theoretical control limit dashed lines
+    ax.axvline(
+        t2_limit,
+        color="#c53030",
+        linestyle="--",
+        linewidth=1.8,
+        label=f"$T^2_{{0.01}}$ Limit ({t2_limit:.2f})",
+    )
+    ax.axhline(
+        spe_limit,
+        color="#805ad5",
+        linestyle="--",
+        linewidth=1.8,
+        label=f"$Q_{{0.01}}$ Limit ({spe_limit:.2f})",
+    )
+
+    ax.set_xlabel(
+        "Hotelling's $T^2$ (Score Space Mahalanobis Distance)",
+        fontsize=11,
+        fontweight="bold",
+    )
+    ax.set_ylabel(
+        "Squared Prediction Error (SPE / Q-Statistic Residual)",
+        fontsize=11,
+        fontweight="bold",
+    )
+    ax.set_title(
+        "Multivariate Outlier Diagnostics: $T^2$ vs SPE (99% Control Limits)",
+        fontsize=12,
+        fontweight="bold",
+        pad=12,
+    )
+
+    info_box = (
+        f"Significance Level: $\\alpha=0.01$ (99%)\n"
+        f"$T^2$ Upper Limit: {t2_limit:.3f}\n"
+        f"SPE Upper Limit: {spe_limit:.3f}\n"
+        f"Pruned Outliers: {n_out} / {n_total} ({pct_out:.2f}%)"
+    )
+    ax.text(
+        0.04,
+        0.94,
+        info_box,
+        transform=ax.transAxes,
+        fontsize=9,
+        verticalalignment="top",
+        bbox={
+            "boxstyle": "round,pad=0.4",
+            "facecolor": "white",
+            "edgecolor": "#cbd5e1",
+            "alpha": 0.92,
+        },
+    )
+
+    ax.legend(loc="upper right", framealpha=0.9, fontsize=9)
+    ax.grid(True, linestyle="--", alpha=0.3)
     fig.tight_layout()
 
     if save_path is not None:
