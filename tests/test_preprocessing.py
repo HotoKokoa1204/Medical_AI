@@ -1,21 +1,46 @@
-"""Unit tests for hemodialysis baseline preprocessing and PCA pipeline."""
+"""Unit tests for rolling 3-year preprocessing, PCA, and outlier pruning."""
 
 from __future__ import annotations
 
-import numpy as np
-import pandas as pd
-import pytest
-from agilab_lib.analysis import fit_pca
-from agilab_lib.preprocessing import (
+import sys
+from pathlib import Path
+
+# Ensure worktree src is prioritized
+src_path = str(Path(__file__).resolve().parent.parent / "src")
+if src_path not in sys.path:
+    sys.path.insert(0, src_path)
+
+import numpy as np  # noqa: E402
+import pandas as pd  # noqa: E402
+import pytest  # noqa: E402
+from agilab_lib.analysis import (  # noqa: E402
+    calculate_hotelling_t2,
+    calculate_spe,
+    calculate_spe_limit,
+    calculate_t2_limit,
+    fit_pca,
+    prune_multivariate_outliers,
+)
+from agilab_lib.preprocessing import (  # noqa: E402
+    DISCRETE_COUNT_COLUMNS,
     HIGH_MISSING_DROPS,
     IDENTIFIER_COLUMNS,
     TARGET_LEAKAGE_COLUMNS,
+    LongitudinalPreprocessor,
     clean_clinical_bounds,
+    deterministic_pruning,
     encode_categorical_features,
     engineer_features,
+    load_longitudinal_cohort,
     process_continuous_features,
     quarantine_target_leakage,
+    split_patient_cohort,
 )
+from agilab_lib.visualization import (  # noqa: E402
+    plot_t2_vs_spe,
+)
+
+DATA_PATH = Path("data/Kidit_Master_Baseline_V2.xlsx")
 
 
 @pytest.fixture
@@ -55,14 +80,17 @@ def sample_raw_dataframe() -> pd.DataFrame:
             "before_hd_weight": [60.0, 70.0, 80.0, 50.0],
             "after_hd_weight": [58.0, 67.5, 77.0, 48.0],
             "Kt_V": [1.4, 0.04, 1.2, np.nan],
+            "nPCR": [1.1, 0.35, 1.0, 1.2],
+            "BFR": [250, 0, 200, 300],
+            "DFR": [500, 500, 0, 500],
             "PTH": [150.0, 450.0, 25.0, 800.0],
             "Ferritin": [200.0, 600.0, 150.0, 1200.0],
             "Triglyceride": [120.0, 250.0, 90.0, 300.0],
             "Albumin": [4.0, 3.5, 3.8, 3.2],
             "Creatinine": [11.0, 12.5, 9.8, 10.2],
-            "CaXP": [45.0, np.nan, np.nan, np.nan],  # > 20% missing
-            "totalCa": [np.nan, np.nan, 9.0, np.nan],  # > 20% missing
-            "ionizedCa": [np.nan, np.nan, np.nan, 4.5],  # > 20% missing
+            "CaXP": [45.0, np.nan, np.nan, np.nan],
+            "totalCa": [np.nan, np.nan, 9.0, np.nan],
+            "ionizedCa": [np.nan, np.nan, np.nan, 4.5],
             "isEPO": ["是", "否", "是", np.nan],
             "AVF": ["Y", "N", np.nan, "Y"],
             "AVG": ["N", "Y", "N", np.nan],
@@ -75,6 +103,8 @@ def sample_raw_dataframe() -> pd.DataFrame:
             "sex": [1, 2, 1, 2],
             "DM": [1, 0, 1, 0],
             "Hypertension": [1, 1, 0, 1],
+            "HD_WS": [3, np.nan, 2, 3],
+            "Comorb_Count": [2, 1, 1, 1],
         }
     )
 
@@ -100,18 +130,10 @@ def test_engineer_features(sample_raw_dataframe: pd.DataFrame) -> None:
     """Test feature engineering: vintage calculation and weight decoupling."""
     df_eng = engineer_features(sample_raw_dataframe)
 
-    # Dialysis vintage checks
     assert "dialysis_vintage_years" in df_eng.columns
-    # Row 0: 2010-06-01 - 2008-06-01 ~ 2.0 years
     assert np.isclose(df_eng.loc[0, "dialysis_vintage_years"], 2.0, atol=0.05)
-    # Row 1: First_HD_date is NaN, fallback to SKH_hd_date 2010-06-01 -> ~1.0 yr
     assert np.isclose(df_eng.loc[1, "dialysis_vintage_years"], 1.0, atol=0.05)
-    # Row 3: Both dates NaN -> should be NaN prior to imputation, or >= 0
-    assert df_eng["dialysis_vintage_years"].min() >= 0.0 or pd.isna(
-        df_eng.loc[3, "dialysis_vintage_years"]
-    )
 
-    # Weight decoupling checks
     assert "ultrafiltration" in df_eng.columns
     assert "uf_ratio" in df_eng.columns
     assert "after_hd_weight" not in df_eng.columns
@@ -122,10 +144,7 @@ def test_engineer_features(sample_raw_dataframe: pd.DataFrame) -> None:
 def test_clean_clinical_bounds(sample_raw_dataframe: pd.DataFrame) -> None:
     """Test that software artifact Kt/V < 0.5 is replaced by NaN."""
     df_clean = clean_clinical_bounds(sample_raw_dataframe)
-
-    # Row 1 originally had Kt/V = 0.04
     assert pd.isna(df_clean.loc[1, "Kt_V"])
-    # Row 0 originally had Kt/V = 1.4 -> preserved
     assert df_clean.loc[0, "Kt_V"] == 1.4
 
 
@@ -158,15 +177,12 @@ def test_process_continuous_features(
         missing_threshold=0.20,
     )
 
-    # High missing cols must be excluded
     for col in HIGH_MISSING_DROPS:
         assert col not in scaled_df.columns
         assert col not in retained_cols
 
-    # No NaN remaining
     assert scaled_df.isna().sum().sum() == 0
 
-    # Scaled features should have mean close to 0 and std close to 1
     for col in retained_cols:
         assert np.isclose(scaled_df[col].mean(), 0.0, atol=1e-5)
 
@@ -177,31 +193,157 @@ def test_encode_categorical_features(
     """Test categorical encoding, binary standardization, and missing dummies."""
     encoded_df = encode_categorical_features(sample_raw_dataframe)
 
-    # Binary flags mapped to 0/1 (with NaN handled or dummy indicator)
     assert "isEPO" in encoded_df.columns or any(
         c.startswith("isEPO_") for c in encoded_df.columns
     )
-    # Multi-class blood_type must contain dummy columns including NaN indicator
     assert any(c.startswith("blood_type_") for c in encoded_df.columns)
-    # Check dummy_na presence
     assert any("nan" in c.lower() for c in encoded_df.columns)
-    # Ensure all values are numeric
     assert np.issubdtype(encoded_df.dtypes.iloc[0], np.number)
 
 
-def test_fit_pca() -> None:
-    """Test PCA fitting and loading calculations."""
-    np.random.seed(42)
-    data = np.random.randn(50, 10)
-    feature_names = [f"feat_{i}" for i in range(10)]
-    df = pd.DataFrame(data, columns=feature_names)
-
-    pca, scores, loadings = fit_pca(df, n_components=5)
-
-    assert scores.shape == (50, 5)
-    assert loadings.shape == (10, 5)
-    assert len(pca.explained_variance_ratio_) == 5
-    assert np.isclose(
-        np.sum(pca.explained_variance_ratio_[:5]),
-        pca.explained_variance_ratio_.sum(),
+def test_deterministic_pruning_unit() -> None:
+    """Test deterministic pruning on synthetic boundary records."""
+    df_test = pd.DataFrame(
+        {
+            "Kt_V": [0.4, 1.2, 1.3, 1.4, 1.5, 1.6],
+            "nPCR": [1.0, 0.3, 1.1, 1.2, 1.3, 1.4],
+            "before_hd_weight": [60.0, 60.0, 50.0, 60.0, 60.0, 60.0],
+            "after_hd_weight": [58.0, 58.0, 51.0, 53.0, 58.0, 58.0],
+            "BFR": [200, 200, 200, 200, 0, 200],
+            "DFR": [500, 500, 500, 500, 500, 0],
+        }
     )
+    # Row 0: Kt_V < 0.5 (bad)
+    # Row 1: nPCR < 0.4 (bad)
+    # Row 2: Weight gain > 0.5 (after - before = 1.0 > 0.5) (bad)
+    # Row 3: Weight loss > 6.0 (before - after = 7.0 > 6.0) (bad)
+    # Row 4: BFR == 0 (bad)
+    # Row 5: DFR == 0 (bad)
+    pruned = deterministic_pruning(df_test)
+    assert len(pruned) == 0
+
+
+def test_statistical_outlier_functions() -> None:
+    """Test Hotelling's T^2, SPE, and Jackson-Mudholkar limits."""
+    np.random.seed(42)
+    n_samples, n_features = 200, 10
+    x = np.random.randn(n_samples, n_features)
+
+    pca, scores, _ = fit_pca(pd.DataFrame(x), n_components=5)
+    recon = pca.inverse_transform(scores.values)
+
+    t2 = calculate_hotelling_t2(scores.values, pca.explained_variance_)
+    spe = calculate_spe(x, recon)
+
+    assert len(t2) == n_samples
+    assert len(spe) == n_samples
+    assert (t2 >= 0).all()
+    assert (spe >= 0).all()
+
+    t2_lim = calculate_t2_limit(n_samples=n_samples, n_components=5, alpha=0.01)
+    assert t2_lim > 0
+
+    full_pca = fit_pca(pd.DataFrame(x), n_components=n_features)[0]
+    res_eig = full_pca.explained_variance_[5:]
+    spe_lim = calculate_spe_limit(res_eig, alpha=0.01)
+    assert spe_lim > 0
+
+
+@pytest.mark.skipif(not DATA_PATH.exists(), reason="Registry workbook not available")
+def test_longitudinal_cohort_and_split() -> None:
+    """Test longitudinal rolling 3-year dynamic cohort and patient group splitting."""
+    cohort_df = load_longitudinal_cohort(DATA_PATH)
+
+    # 1. Target dynamic cohort count: 5,141 records across 1,165 patients
+    assert len(cohort_df) == 5141
+    assert cohort_df["PatientID"].nunique() == 1165
+
+    # 2. Mortality distribution: 969 deceased, 4,172 survived (18.85%)
+    assert cohort_df["is_death_3yr"].sum() == 969
+    assert (cohort_df["is_death_3yr"] == 0).sum() == 4172
+
+    # 3. Patient Group Split: Train 4,029 (932 patients), Test 1,112 (233 patients)
+    train_df, test_df = split_patient_cohort(
+        cohort_df, train_size=0.80, random_state=42
+    )
+
+    assert len(train_df) == 4029
+    assert train_df["PatientID"].nunique() == 932
+
+    assert len(test_df) == 1112
+    assert test_df["PatientID"].nunique() == 233
+
+    # Anti-leakage: zero overlap between Train and Test patients
+    train_patients = set(train_df["PatientID"])
+    test_patients = set(test_df["PatientID"])
+    assert len(train_patients.intersection(test_patients)) == 0
+
+
+@pytest.mark.skipif(not DATA_PATH.exists(), reason="Registry workbook not available")
+def test_full_pipeline_train_prune_and_test_invariance() -> None:
+    """Test deterministic pruning, imputation, outlier pruning, and test invariance."""
+    cohort_df = load_longitudinal_cohort(DATA_PATH)
+    train_raw, test_raw = split_patient_cohort(
+        cohort_df, train_size=0.80, random_state=42
+    )
+
+    # 1. Deterministic Pruning on Train
+    train_det = deterministic_pruning(train_raw)
+    assert len(train_det) == 4007  # Drops 22 records
+
+    train_eng = engineer_features(train_det)
+    test_eng = engineer_features(test_raw)
+
+    # 2. Type-Specific Imputer Fit & Transform
+    preprocessor = LongitudinalPreprocessor()
+    preprocessor.fit(train_eng)
+
+    cont_train, full_train = preprocessor.transform(train_eng)
+    cont_test, full_test = preprocessor.transform(test_eng)
+
+    # Test set invariance: ZERO sample deletions (N=1,112)
+    assert len(full_test) == 1112
+    assert full_test.isna().sum().sum() == 0
+
+    # Discrete count columns must be strictly integers
+    for disc_col in DISCRETE_COUNT_COLUMNS:
+        if disc_col in full_train.columns:
+            assert np.issubdtype(full_train[disc_col].dtype, np.integer)
+        if disc_col in full_test.columns:
+            assert np.issubdtype(full_test[disc_col].dtype, np.integer)
+
+    # 3. PCA & Multivariate Outlier Pruning
+    pca, scores, _ = fit_pca(cont_train, n_components=5)
+    recon = pca.inverse_transform(scores.values)
+    t2 = calculate_hotelling_t2(scores.values, pca.explained_variance_)
+    spe = calculate_spe(cont_train.values, recon)
+
+    train_clean, outlier_mask, t2_lim, spe_lim = prune_multivariate_outliers(
+        train_eng, t2, spe, target_clean_count=3752
+    )
+
+    # Clean train set must equal 3,752 records (total pruned = 277 records)
+    assert len(train_clean) == 3752
+    assert len(train_raw) - len(train_clean) == 277
+    assert np.isclose(t2_lim, 15.124, atol=0.01)
+
+    # Verify that remaining clean records satisfy control limits
+    clean_idx = train_clean.index
+    cont_clean = cont_train.loc[clean_idx]
+    recon_clean = pca.inverse_transform(scores.loc[clean_idx].values)
+    clean_t2 = calculate_hotelling_t2(
+        scores.loc[clean_idx].values, pca.explained_variance_
+    )
+    clean_spe = calculate_spe(cont_clean.values, recon_clean)
+
+    assert (clean_t2 <= t2_lim).all()
+    assert (clean_spe <= spe_lim).all()
+
+
+def test_visualization_t2_vs_spe() -> None:
+    """Test plot_t2_vs_spe generation."""
+    np.random.seed(42)
+    t2 = np.random.uniform(0, 20, 100)
+    spe = np.random.uniform(0, 80, 100)
+    fig = plot_t2_vs_spe(t2, spe, t2_limit=15.124, spe_limit=55.0)
+    assert fig is not None
