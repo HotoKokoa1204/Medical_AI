@@ -7,6 +7,7 @@ Description: Preprocessing for hemodialysis rolling 3-year mortality.
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Sequence
 
@@ -15,6 +16,8 @@ import pandas as pd
 from sklearn.impute import SimpleImputer
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
+
+logger = logging.getLogger(__name__)
 
 # Excluded target leakage and future follow-up columns
 TARGET_LEAKAGE_COLUMNS: list[str] = [
@@ -110,15 +113,7 @@ DEFAULT_CONTINUOUS_COLUMNS: list[str] = [
     "Tranferrin_saturation",
     "BFR",
     "DFR",
-    "HD_WS",
-    "HD_ST",
     "HD_MSA",
-    "ID_U",
-    "MD_U",
-    "CIC",
-    "genAssess",
-    "actAssess",
-    "Comorb_Count",
 ]
 
 # Discrete count / schedule features to be imputed via integer mode
@@ -304,10 +299,14 @@ def deterministic_pruning(df: pd.DataFrame) -> pd.DataFrame:
     Prunes rows satisfying any of:
         - Kt/V < 0.5
         - nPCR < 0.4
-        - Weight gain: (after_hd_weight - before_hd_weight) > 0.5 kg
-        - Weight loss: (before_hd_weight - after_hd_weight) > 6.0 kg
+        - Weight gain: (after_hd - before_hd) > 0.5 kg (or ultrafiltration < -0.5)
+        - Weight loss: (before_hd - after_hd) > 6.0 kg (or ultrafiltration > 6.0)
         - BFR < 100 or BFR == 0
         - DFR < 300 or DFR == 0
+        - BUN inversion: after_hd_BUN >= before_hd_BUN without Kt_V >= 1.0 (Spec 60)
+
+    Also logs clinical alerts for extreme hypokalemia (K < 2.5 mEq/L) while retaining
+    observations per Spec line 42.
 
     Args:
         df: Input training DataFrame.
@@ -337,6 +336,29 @@ def deterministic_pruning(df: pd.DataFrame) -> pd.DataFrame:
 
     if "DFR" in df.columns:
         bad_mask |= (df["DFR"] < 300) | (df["DFR"] == 0)
+
+    # BUN Inversion check (Spec line 60):
+    # after_hd_BUN >= before_hd_BUN is an error unless verified by Kt_V >= 1.0
+    if "before_hd_BUN" in df.columns and "after_hd_BUN" in df.columns:
+        bun_inv = (
+            (df["after_hd_BUN"] >= df["before_hd_BUN"])
+            & df["after_hd_BUN"].notna()
+            & df["before_hd_BUN"].notna()
+        )
+        if "Kt_V" in df.columns:
+            verified = (df["Kt_V"] >= 1.0) & df["Kt_V"].notna()
+            bun_inv = bun_inv & (~verified)
+        bad_mask |= bun_inv
+
+    # Extreme hypokalemia logging (Spec line 42): retain observations
+    if "K" in df.columns:
+        hypo_cnt = int(((df["K"] < 2.5) & df["K"].notna()).sum())
+        if hypo_cnt > 0:
+            logger.warning(
+                "Clinical alert: Detected %d records with extreme hypokalemia "
+                "(K < 2.5 mEq/L); retaining observations per Spec line 42.",
+                hypo_cnt,
+            )
 
     return df[~bad_mask].copy()
 
@@ -408,6 +430,19 @@ def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
         df_eng["ultrafiltration"] = uf_clamped
         df_eng["uf_ratio"] = uf_ratio
         df_eng = df_eng.drop(columns=["after_hd_weight"])
+
+    # Extreme potassium warning flag (Spec line 42)
+    if "K" in df_eng.columns:
+        df_eng["is_extreme_hypokalemia"] = (
+            (df_eng["K"] < 2.5) & df_eng["K"].notna()
+        ).astype(int)
+        n_hypo = int(df_eng["is_extreme_hypokalemia"].sum())
+        if n_hypo > 0:
+            logger.warning(
+                "Clinical alert: Flagged %d records with extreme hypokalemia "
+                "(K < 2.5 mEq/L); retaining observations per Spec line 42.",
+                n_hypo,
+            )
 
     # Drop raw date objects after derivation
     for date_col in ["First_HD_date", "SKH_hd_date"]:
@@ -513,6 +548,7 @@ class LongitudinalPreprocessor:
             for c in candidates
             if c in df.columns
             and c not in HIGH_MISSING_DROPS
+            and c not in self.discrete_cols_input
             and df[c].isna().mean() <= self.missing_threshold
         ]
 
@@ -617,6 +653,18 @@ class LongitudinalPreprocessor:
         else:
             comorb_df = pd.DataFrame(index=df.index)
 
+        # 6. Extra clinical indicators
+        extra_flags: dict[str, pd.Series] = {}
+        if "is_extreme_hypokalemia" in df.columns:
+            extra_flags["is_extreme_hypokalemia"] = df["is_extreme_hypokalemia"].astype(
+                int
+            )
+        extra_df = (
+            pd.DataFrame(extra_flags, index=df.index)
+            if extra_flags
+            else pd.DataFrame(index=df.index)
+        )
+
         # Combine into full feature matrix without duplicate column names
         cont_cols_for_full = [
             c for c in self.retained_cont_cols if c not in self.retained_disc_cols
@@ -628,6 +676,7 @@ class LongitudinalPreprocessor:
                 sex_df,
                 categorical_df,
                 comorb_df,
+                extra_df,
             ],
             axis=1,
         )
@@ -659,6 +708,9 @@ def process_continuous_features(
 ) -> tuple[pd.DataFrame, SimpleImputer, StandardScaler, list[str]]:
     """Clean, impute, log-transform, and scale continuous laboratory features.
 
+    Delegates to LongitudinalPreprocessor to maintain a single canonical
+    imputation and scaling implementation across the library.
+
     Args:
         df: DataFrame containing continuous clinical features.
         continuous_columns: List of candidate continuous column names.
@@ -668,35 +720,18 @@ def process_continuous_features(
     Returns:
         A tuple of (scaled_df, imputer, scaler, retained_columns).
     """
-    candidates = (
-        list(continuous_columns)
-        if continuous_columns is not None
-        else [c for c in DEFAULT_CONTINUOUS_COLUMNS if c in df.columns]
+    preprocessor = LongitudinalPreprocessor(
+        continuous_cols=continuous_columns,
+        missing_threshold=missing_threshold,
     )
-
-    retained_cols: list[str] = [
-        col
-        for col in candidates
-        if col not in HIGH_MISSING_DROPS
-        and col in df.columns
-        and df[col].isna().mean() <= missing_threshold
-    ]
-
-    subset = df[retained_cols].copy()
-
-    imputer = SimpleImputer(strategy="median")
-    imputed_arr = imputer.fit_transform(subset)
-    imputed_df = pd.DataFrame(imputed_arr, columns=retained_cols, index=df.index)
-
-    for col in LOG_TRANSFORM_COLUMNS:
-        if col in imputed_df.columns:
-            imputed_df[col] = np.log1p(imputed_df[col].clip(lower=0))
-
-    scaler = StandardScaler()
-    scaled_arr = scaler.fit_transform(imputed_df)
-    scaled_df = pd.DataFrame(scaled_arr, columns=retained_cols, index=df.index)
-
-    return scaled_df, imputer, scaler, retained_cols
+    preprocessor.fit(df)
+    cont_df, _ = preprocessor.transform(df)
+    return (
+        cont_df,
+        preprocessor.cont_imputer,
+        preprocessor.scaler,
+        preprocessor.retained_cont_cols,
+    )
 
 
 def encode_categorical_features(df: pd.DataFrame) -> pd.DataFrame:

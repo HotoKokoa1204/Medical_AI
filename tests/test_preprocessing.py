@@ -1,4 +1,10 @@
-"""Unit tests for rolling 3-year preprocessing, PCA, and outlier pruning."""
+"""Module: test_preprocessing
+Stage: Script
+Author: KafuuChino
+Date: 2026-09-28
+Description: Unit tests for longitudinal rolling 3-year preprocessing, PCA,
+    and outlier detection pipeline.
+"""
 
 from __future__ import annotations
 
@@ -91,7 +97,8 @@ def sample_raw_dataframe() -> pd.DataFrame:
             "Creatinine": [11.0, 12.5, 9.8, 10.2],
             "CaXP": [45.0, np.nan, np.nan, np.nan],
             "totalCa": [np.nan, np.nan, 9.0, np.nan],
-            "ionizedCa": [np.nan, np.nan, np.nan, 4.5],
+            "ionizedCa": [np.nan, np.nan, 4.5, np.nan],
+            "K": [3.5, 2.2, 4.0, 5.1],
             "isEPO": ["是", "否", "是", np.nan],
             "AVF": ["Y", "N", np.nan, "Y"],
             "AVG": ["N", "Y", "N", np.nan],
@@ -203,15 +210,17 @@ def test_encode_categorical_features(
 
 
 def test_deterministic_pruning_unit() -> None:
-    """Test deterministic pruning on synthetic boundary records."""
+    """Test deterministic pruning on synthetic records including BUN inversion."""
     df_test = pd.DataFrame(
         {
-            "Kt_V": [0.4, 1.2, 1.3, 1.4, 1.5, 1.6],
-            "nPCR": [1.0, 0.3, 1.1, 1.2, 1.3, 1.4],
-            "before_hd_weight": [60.0, 60.0, 50.0, 60.0, 60.0, 60.0],
-            "after_hd_weight": [58.0, 58.0, 51.0, 53.0, 58.0, 58.0],
-            "BFR": [200, 200, 200, 200, 0, 200],
-            "DFR": [500, 500, 500, 500, 500, 0],
+            "Kt_V": [0.4, 1.2, 1.3, 1.4, 1.5, 1.6, 0.8, 1.3],
+            "nPCR": [1.0, 0.3, 1.1, 1.2, 1.3, 1.4, 1.1, 1.1],
+            "before_hd_weight": [60.0, 60.0, 50.0, 60.0, 60.0, 60.0, 60.0, 60.0],
+            "after_hd_weight": [58.0, 58.0, 51.0, 53.0, 58.0, 58.0, 58.0, 58.0],
+            "BFR": [200, 200, 200, 200, 0, 200, 200, 200],
+            "DFR": [500, 500, 500, 500, 500, 0, 500, 500],
+            "before_hd_BUN": [60.0, 60.0, 60.0, 60.0, 60.0, 60.0, 60.0, 60.0],
+            "after_hd_BUN": [20.0, 20.0, 20.0, 20.0, 20.0, 20.0, 65.0, 65.0],
         }
     )
     # Row 0: Kt_V < 0.5 (bad)
@@ -220,8 +229,36 @@ def test_deterministic_pruning_unit() -> None:
     # Row 3: Weight loss > 6.0 (before - after = 7.0 > 6.0) (bad)
     # Row 4: BFR == 0 (bad)
     # Row 5: DFR == 0 (bad)
+    # Row 6: BUN inversion with Kt_V < 1.0 (unverified inversion, bad)
+    # Row 7: BUN inversion with Kt_V >= 1.0 (verified inversion, retained)
     pruned = deterministic_pruning(df_test)
-    assert len(pruned) == 0
+    assert len(pruned) == 1
+    assert pruned.index[0] == 7
+
+
+def test_extreme_hypokalemia_flag(sample_raw_dataframe: pd.DataFrame) -> None:
+    """Test extreme hypokalemia (K < 2.5) warning flag and retention (Spec 42)."""
+    df_eng = engineer_features(sample_raw_dataframe)
+    assert "is_extreme_hypokalemia" in df_eng.columns
+    # Row 1 has K = 2.2 < 2.5 -> flagged as 1
+    assert df_eng.loc[1, "is_extreme_hypokalemia"] == 1
+    # Row 0 has K = 3.5 -> 0
+    assert df_eng.loc[0, "is_extreme_hypokalemia"] == 0
+
+    # Ensure deterministic pruning does not drop row 1 due to K < 2.5
+    df_single = pd.DataFrame(
+        {
+            "K": [2.2],
+            "Kt_V": [1.4],
+            "nPCR": [1.1],
+            "before_hd_weight": [60.0],
+            "after_hd_weight": [58.0],
+            "BFR": [250],
+            "DFR": [500],
+        }
+    )
+    pruned = deterministic_pruning(df_single)
+    assert len(pruned) == 1
 
 
 def test_statistical_outlier_functions() -> None:
@@ -248,6 +285,19 @@ def test_statistical_outlier_functions() -> None:
     res_eig = full_pca.explained_variance_[5:]
     spe_lim = calculate_spe_limit(res_eig, alpha=0.01)
     assert spe_lim > 0
+
+    # Test refactored prune_multivariate_outliers (Feature Envy resolved)
+    is_outlier, eff_t2, eff_spe = prune_multivariate_outliers(
+        scores=scores,
+        spe=spe,
+        explained_variance=pca.explained_variance_,
+        residual_eigenvalues=res_eig,
+        alpha=0.01,
+    )
+    assert len(is_outlier) == n_samples
+    assert is_outlier.dtype == bool
+    assert eff_t2 > 0
+    assert eff_spe > 0
 
 
 @pytest.mark.skipif(not DATA_PATH.exists(), reason="Registry workbook not available")
@@ -282,24 +332,25 @@ def test_longitudinal_cohort_and_split() -> None:
 
 @pytest.mark.skipif(not DATA_PATH.exists(), reason="Registry workbook not available")
 def test_full_pipeline_train_prune_and_test_invariance() -> None:
-    """Test deterministic pruning, imputation, outlier pruning, and test invariance."""
+    """Test Spec line 54 sequence: split -> engineer -> prune -> fit -> test."""
     cohort_df = load_longitudinal_cohort(DATA_PATH)
     train_raw, test_raw = split_patient_cohort(
         cohort_df, train_size=0.80, random_state=42
     )
 
-    # 1. Deterministic Pruning on Train
-    train_det = deterministic_pruning(train_raw)
-    assert len(train_det) == 4007  # Drops 22 records
-
-    train_eng = engineer_features(train_det)
+    # 1. Feature Engineering
+    train_eng = engineer_features(train_raw)
     test_eng = engineer_features(test_raw)
 
-    # 2. Type-Specific Imputer Fit & Transform
-    preprocessor = LongitudinalPreprocessor()
-    preprocessor.fit(train_eng)
+    # 2. Deterministic Pruning on Train
+    train_det = deterministic_pruning(train_eng)
+    assert len(train_det) == 4007  # Drops 22 records
 
-    cont_train, full_train = preprocessor.transform(train_eng)
+    # 3. Type-Specific Imputer Fit & Transform
+    preprocessor = LongitudinalPreprocessor()
+    preprocessor.fit(train_det)
+
+    cont_train, full_train = preprocessor.transform(train_det)
     cont_test, full_test = preprocessor.transform(test_eng)
 
     # Test set invariance: ZERO sample deletions (N=1,112)
@@ -313,32 +364,91 @@ def test_full_pipeline_train_prune_and_test_invariance() -> None:
         if disc_col in full_test.columns:
             assert np.issubdtype(full_test[disc_col].dtype, np.integer)
 
-    # 3. PCA & Multivariate Outlier Pruning
+    # 4. PCA & Multivariate Outlier Pruning with genuine Jackson-Mudholkar
     pca, scores, _ = fit_pca(cont_train, n_components=5)
     recon = pca.inverse_transform(scores.values)
     t2 = calculate_hotelling_t2(scores.values, pca.explained_variance_)
     spe = calculate_spe(cont_train.values, recon)
 
-    train_clean, outlier_mask, t2_lim, spe_lim = prune_multivariate_outliers(
-        train_eng, t2, spe, target_clean_count=3752
+    pca_full = fit_pca(cont_train, n_components=cont_train.shape[1])[0]
+    res_eig = pca_full.explained_variance_[5:]
+
+    is_outlier, t2_lim, spe_lim = prune_multivariate_outliers(
+        scores=scores,
+        spe=spe,
+        t2=t2,
+        explained_variance=pca.explained_variance_,
+        residual_eigenvalues=res_eig,
+        alpha=0.01,
     )
 
-    # Clean train set must equal 3,752 records (total pruned = 277 records)
-    assert len(train_clean) == 3752
-    assert len(train_raw) - len(train_clean) == 277
+    clean_mask = ~is_outlier
+    train_clean = train_det[clean_mask]
+    cont_clean = cont_train[clean_mask]
+
+    assert len(train_clean) == 3737
     assert np.isclose(t2_lim, 15.124, atol=0.01)
+    assert np.isclose(spe_lim, 43.722, atol=0.01)
 
     # Verify that remaining clean records satisfy control limits
-    clean_idx = train_clean.index
-    cont_clean = cont_train.loc[clean_idx]
-    recon_clean = pca.inverse_transform(scores.loc[clean_idx].values)
-    clean_t2 = calculate_hotelling_t2(
-        scores.loc[clean_idx].values, pca.explained_variance_
-    )
+    clean_scores = scores[clean_mask]
+    recon_clean = pca.inverse_transform(clean_scores.values)
+    clean_t2 = calculate_hotelling_t2(clean_scores.values, pca.explained_variance_)
     clean_spe = calculate_spe(cont_clean.values, recon_clean)
 
     assert (clean_t2 <= t2_lim).all()
     assert (clean_spe <= spe_lim).all()
+
+
+@pytest.mark.skipif(not DATA_PATH.exists(), reason="Registry workbook not available")
+def test_anti_leakage_statistics() -> None:
+    """Verify test set statistics do not match imputer/scaler parameters (Spec 83)."""
+    cohort_df = load_longitudinal_cohort(DATA_PATH)
+    train_raw, test_raw = split_patient_cohort(
+        cohort_df, train_size=0.80, random_state=42
+    )
+
+    train_eng = engineer_features(train_raw)
+    test_eng = engineer_features(test_raw)
+    train_det = deterministic_pruning(train_eng)
+
+    preprocessor = LongitudinalPreprocessor()
+    preprocessor.fit(train_det)
+
+    retained_cols = preprocessor.retained_cont_cols
+    test_medians = test_eng[retained_cols].median().values
+    train_medians = train_det[retained_cols].median().values
+    fitted_imputer_medians = preprocessor.cont_imputer.statistics_
+
+    # Fitted parameters must match training data and diverge from test data
+    assert np.allclose(train_medians, fitted_imputer_medians)
+    assert not np.allclose(test_medians, fitted_imputer_medians)
+
+    # Test scaler parameters: scaler mean matches train and diverges from test
+    fitted_scaler_mean = preprocessor.scaler.mean_
+    test_means = test_eng[retained_cols].mean().values
+    assert not np.allclose(test_means, fitted_scaler_mean)
+
+
+@pytest.mark.skipif(not DATA_PATH.exists(), reason="Registry workbook not available")
+def test_pruning_boundary_verification() -> None:
+    """Assert cleaned train set has no Kt/V < 0.5, UF > 6.0, or BFR == 0 (Spec 87)."""
+    cohort_df = load_longitudinal_cohort(DATA_PATH)
+    train_raw, test_raw = split_patient_cohort(
+        cohort_df, train_size=0.80, random_state=42
+    )
+
+    train_eng = engineer_features(train_raw)
+    train_det = deterministic_pruning(train_eng)
+
+    # Cleaned training set must have zero boundary violations:
+    assert (train_det["Kt_V"] < 0.5).sum() == 0
+    assert (train_det["ultrafiltration"] > 6.0).sum() == 0
+    assert (train_det["BFR"] == 0).sum() == 0
+
+    # In contrast, raw train set contained violations that were pruned
+    assert ((train_raw["Kt_V"] < 0.5) & train_raw["Kt_V"].notna()).sum() > 0
+    assert ((train_raw["BFR"] == 0) & train_raw["BFR"].notna()).sum() > 0
 
 
 def test_visualization_t2_vs_spe() -> None:
