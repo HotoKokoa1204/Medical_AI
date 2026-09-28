@@ -151,6 +151,15 @@ def calculate_spe_limit(
 ) -> float:
     """Compute theoretical control limit for SPE via Jackson-Mudholkar approximation.
 
+    When PCA retains k components out of p features, residual eigenvalues
+    theta_1 = sum_{j=k+1}^p lambda_j, theta_2 = sum_{j=k+1}^p lambda_j^2,
+    theta_3 = sum_{j=k+1}^p lambda_j^3.
+    h_0 = 1 - (2 * theta_1 * theta_3) / (3 * theta_2^2).
+    Q_alpha = theta_1 * (
+        1 - (theta_2 * h_0 * (1 - h_0)) / theta_1^2
+        + z_alpha * sqrt(2 * theta_2 * h_0^2) / theta_1
+    ) ** (1 / h_0).
+
     Args:
         residual_eigenvalues: Eigenvalues of unmodeled residual dimensions.
         alpha: Significance level (default 0.01 for 99% confidence).
@@ -158,82 +167,89 @@ def calculate_spe_limit(
     Returns:
         Theoretical SPE threshold Q_alpha.
     """
-    eigvals = np.asarray(residual_eigenvalues)
+    eigvals = np.asarray(residual_eigenvalues, dtype=float)
     th1 = float(np.sum(eigvals))
     th2 = float(np.sum(eigvals**2))
     th3 = float(np.sum(eigvals**3))
 
     h0 = 1.0 - (2.0 * th1 * th3) / (3.0 * (th2**2))
-    c_alpha = float(norm.ppf(1.0 - alpha))
+    z_alpha = float(norm.ppf(1.0 - alpha))
 
-    term1 = c_alpha * np.sqrt(2.0 * th2 * (h0**2)) / th1
-    term2 = (th2 * h0 * (h0 - 1.0)) / (th1**2)
+    term_cov = (th2 * h0 * (1.0 - h0)) / (th1**2)
+    term_z = z_alpha * np.sqrt(2.0 * th2 * (h0**2)) / th1
 
-    base = 1.0 + term1 + term2
+    base = 1.0 - term_cov + term_z
     spe_lim = float(th1 * (max(base, 1e-12) ** (1.0 / h0)))
     return spe_lim
 
 
 def prune_multivariate_outliers(
-    df: pd.DataFrame,
-    t2: np.ndarray,
-    spe: np.ndarray,
+    scores: np.ndarray | pd.DataFrame,
+    spe: np.ndarray | pd.Series,
+    explained_variance: np.ndarray | Sequence[float] | None = None,
     t2_limit: float | None = None,
     spe_limit: float | None = None,
-    target_clean_count: int | None = 3752,
     alpha: float = 0.01,
-    residual_eigenvalues: np.ndarray | None = None,
-) -> tuple[pd.DataFrame, np.ndarray, float, float]:
-    """Filter records exceeding Hotelling's T^2 or SPE control limits.
+    residual_eigenvalues: np.ndarray | Sequence[float] | None = None,
+    t2: np.ndarray | pd.Series | None = None,
+) -> tuple[np.ndarray, float, float]:
+    """Identify multivariate outliers exceeding Hotelling's T^2 or SPE control limits.
+
+    Operates purely on multivariate projection scores and SPE residuals to avoid
+    feature envy with domain DataFrame structures.
 
     Args:
-        df: Input DataFrame to prune.
-        t2: Array of Hotelling's T^2 statistics.
-        spe: Array of SPE statistics.
+        scores: Projection scores array (n_samples, n_components) or precomputed T^2.
+        spe: Array of Squared Prediction Error (Q-statistic) values (n_samples,).
+        explained_variance: Explained variance of retained components (required if
+            scores is 2D and t2 is None).
         t2_limit: Critical threshold for T^2. If None, derived via calculate_t2_limit.
-        spe_limit: Critical threshold for SPE. If None, derived via Jackson-Mudholkar
-            or calibrated to match target_clean_count.
-        target_clean_count: Target count of retained records (default 3,752).
-        alpha: Significance level (default 0.01).
-        residual_eigenvalues: Optional residual eigenvalues for Jackson-Mudholkar.
+        spe_limit: Critical threshold for SPE. If None, derived via calculate_spe_limit
+            with residual_eigenvalues, or fallback to (1 - alpha) empirical percentile.
+        alpha: Significance level (default 0.01 for 99% confidence).
+        residual_eigenvalues: Optional residual eigenvalues (lambda_{k+1} to lambda_p)
+            for genuine Jackson-Mudholkar calculation.
+        t2: Optional precomputed Hotelling's T^2 statistics.
 
     Returns:
-        A tuple of (cleaned_df, outlier_mask, effective_t2_limit, effective_spe_limit).
+        A tuple of:
+            - is_outlier: Boolean numpy array of shape (n_samples,) indicating outliers.
+            - effective_t2_limit: Upper control limit applied for Hotelling's T^2.
+            - effective_spe_limit: Upper control limit applied for SPE.
     """
-    n_samples = len(df)
-    effective_t2 = (
-        t2_limit
-        if t2_limit is not None
-        else calculate_t2_limit(n_samples=n_samples, n_components=5, alpha=alpha)
-    )
+    spe_arr = np.asarray(spe, dtype=float)
+    n_samples = len(spe_arr)
 
-    t2_outliers = t2 > effective_t2
+    # Resolve T^2 statistic
+    if t2 is not None:
+        t2_arr = np.asarray(t2, dtype=float)
+    elif hasattr(scores, "ndim") and scores.ndim == 1:
+        t2_arr = np.asarray(scores, dtype=float)
+    else:
+        if explained_variance is None:
+            raise ValueError(
+                "explained_variance must be provided when scores is 2D and t2 is None."
+            )
+        t2_arr = calculate_hotelling_t2(scores, explained_variance)
 
+    # Determine Hotelling's T^2 limit
+    if t2_limit is not None:
+        effective_t2 = float(t2_limit)
+    else:
+        n_comp = (
+            scores.shape[1] if (hasattr(scores, "ndim") and scores.ndim == 2) else 5
+        )
+        effective_t2 = calculate_t2_limit(
+            n_samples=n_samples, n_components=n_comp, alpha=alpha
+        )
+
+    # Determine SPE limit via Jackson-Mudholkar or explicit threshold
     if spe_limit is not None:
-        effective_spe = spe_limit
-    elif target_clean_count is not None and target_clean_count < n_samples:
-        # Calibrate spe_limit to achieve target clean count
-        target_outliers = n_samples - target_clean_count
-        best_spe = float(np.percentile(spe, 95))
-        # Search for spe threshold where (t2_outliers | (spe > q)) == target_outliers
-        low, high = float(np.min(spe)), float(np.max(spe))
-        candidate_thresholds = np.linspace(low, high, 5000)
-        found = False
-        for q in candidate_thresholds:
-            out_cnt = int(np.sum(t2_outliers | (spe > q)))
-            if out_cnt == target_outliers:
-                best_spe = float(q)
-                found = True
-                break
-        if not found and residual_eigenvalues is not None:
-            best_spe = calculate_spe_limit(residual_eigenvalues, alpha=alpha)
-        effective_spe = best_spe
+        effective_spe = float(spe_limit)
     elif residual_eigenvalues is not None:
         effective_spe = calculate_spe_limit(residual_eigenvalues, alpha=alpha)
     else:
-        effective_spe = float(np.percentile(spe, (1.0 - alpha) * 100))
+        effective_spe = float(np.percentile(spe_arr, (1.0 - alpha) * 100.0))
 
-    outlier_mask = t2_outliers | (spe > effective_spe)
-    cleaned_df = df[~outlier_mask].copy()
-
-    return cleaned_df, outlier_mask, effective_t2, effective_spe
+    is_outlier = (t2_arr > effective_t2) | (spe_arr > effective_spe)
+    return is_outlier, effective_t2, effective_spe
