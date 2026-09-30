@@ -19,10 +19,6 @@ if src_path not in sys.path:
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import pytest  # noqa: E402
-from imblearn.over_sampling import SMOTENC  # noqa: E402
-from sklearn.linear_model import LogisticRegression  # noqa: E402
-from sklearn.model_selection import GroupKFold  # noqa: E402
-
 from agilab_lib.modeling import (  # noqa: E402
     BenchmarkModelResult,
     calculate_metrics,
@@ -38,15 +34,18 @@ from agilab_lib.visualization import (  # noqa: E402
     plot_benchmark_roc_curves,
     plot_top_feature_importance,
 )
+from imblearn.over_sampling import SMOTENC  # noqa: E402
+from sklearn.linear_model import LogisticRegression  # noqa: E402
+from sklearn.model_selection import GroupKFold  # noqa: E402
 
 TRAIN_PARQUET_PATH = Path("data/processed/train_cleaned_rolling_3yr.parquet")
 TEST_PARQUET_PATH = Path("data/processed/test_uncurated_rolling_3yr.parquet")
 
 
 @pytest.fixture
-def synthetic_mixed_cohort() -> tuple[
-    pd.DataFrame, np.ndarray, np.ndarray, pd.DataFrame, np.ndarray, np.ndarray
-]:
+def synthetic_mixed_cohort() -> (
+    tuple[pd.DataFrame, np.ndarray, np.ndarray, pd.DataFrame, np.ndarray, np.ndarray]
+):
     """Generate reproducible synthetic mixed cohort with patient clusters.
 
     Returns:
@@ -262,9 +261,9 @@ def test_infold_smote_nc_isolation(
     x_res, _ = sm.fit_resample(x_train, y_train)
     for col in ["bin_chf", "bin_cad", "bin_dm"]:
         unique_vals = set(x_res[col].unique())
-        assert unique_vals.issubset({0.0, 1.0, 0, 1}), (
-            f"Non-binary comorbidity generated: {unique_vals}"
-        )
+        assert unique_vals.issubset(
+            {0.0, 1.0, 0, 1}
+        ), f"Non-binary comorbidity generated: {unique_vals}"
 
 
 def test_calculate_metrics_correctness() -> None:
@@ -329,12 +328,12 @@ def test_all_11_models_synthetic_battery(
         # Assert probabilities are valid and bounded in [0, 1]
         assert not np.isnan(test_probs).any(), f"NaNs in test probs for {name}"
         assert not np.isnan(oof_probs).any(), f"NaNs in OOF probs for {name}"
-        assert np.all((test_probs >= 0.0) & (test_probs <= 1.0)), (
-            f"Out of bounds prob for {name}"
-        )
-        assert np.all((oof_probs >= 0.0) & (oof_probs <= 1.0)), (
-            f"Out of bounds OOF prob for {name}"
-        )
+        assert np.all(
+            (test_probs >= 0.0) & (test_probs <= 1.0)
+        ), f"Out of bounds prob for {name}"
+        assert np.all(
+            (oof_probs >= 0.0) & (oof_probs <= 1.0)
+        ), f"Out of bounds OOF prob for {name}"
 
         # Assert decisions are binary
         assert set(res["test_pred_default"]).issubset({0, 1})
