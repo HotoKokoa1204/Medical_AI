@@ -19,6 +19,7 @@ if src_path not in sys.path:
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import pytest  # noqa: E402
+
 from agilab_lib.analysis import (  # noqa: E402
     calculate_hotelling_t2,
     calculate_spe,

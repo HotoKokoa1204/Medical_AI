@@ -335,9 +335,9 @@ def main() -> int:
     print(f"  [OK] Unique Training Patients: {n_unique_patients}")
 
     overlap_patients = set(train_groups).intersection(set(test_groups))
-    assert (
-        len(overlap_patients) == 0
-    ), f"Subject leakage detected: {len(overlap_patients)} overlap!"
+    assert len(overlap_patients) == 0, (
+        f"Subject leakage detected: {len(overlap_patients)} overlap!"
+    )
     print(
         "  [OK] Patient Grouping Isolation Verified: "
         "Train Patients ∩ Test Patients == ∅"
