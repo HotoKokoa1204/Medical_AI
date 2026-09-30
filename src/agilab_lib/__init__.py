@@ -16,6 +16,8 @@ from agilab_lib.analysis import (
 )
 from agilab_lib.modeling import (
     DEFAULT_DISCRETE_COLUMNS,
+    BenchmarkModelResult,
+    BenchmarkSuiteResult,
     calculate_metrics,
     create_smote_pipeline,
     evaluate_model_cv_and_test,
@@ -87,6 +89,8 @@ __all__ = [
     "calculate_metrics",
     "evaluate_model_cv_and_test",
     "run_benchmark_suite",
+    "BenchmarkModelResult",
+    "BenchmarkSuiteResult",
     "TARGET_LEAKAGE_COLUMNS",
     "IDENTIFIER_COLUMNS",
     "LABEL_COLUMN",

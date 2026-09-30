@@ -69,3 +69,6 @@ venv.bak/
 
 # CatBoost
 catboost_info/
+
+# Model Checkpoints
+models/checkpoints/*.joblib

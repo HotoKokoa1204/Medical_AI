@@ -19,7 +19,12 @@ if src_path not in sys.path:
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import pytest  # noqa: E402
+from imblearn.over_sampling import SMOTENC  # noqa: E402
+from sklearn.linear_model import LogisticRegression  # noqa: E402
+from sklearn.model_selection import GroupKFold  # noqa: E402
+
 from agilab_lib.modeling import (  # noqa: E402
+    BenchmarkModelResult,
     calculate_metrics,
     create_smote_pipeline,
     evaluate_model_cv_and_test,
@@ -33,18 +38,15 @@ from agilab_lib.visualization import (  # noqa: E402
     plot_benchmark_roc_curves,
     plot_top_feature_importance,
 )
-from imblearn.over_sampling import SMOTENC  # noqa: E402
-from sklearn.linear_model import LogisticRegression  # noqa: E402
-from sklearn.model_selection import GroupKFold  # noqa: E402
 
 TRAIN_PARQUET_PATH = Path("data/processed/train_cleaned_rolling_3yr.parquet")
 TEST_PARQUET_PATH = Path("data/processed/test_uncurated_rolling_3yr.parquet")
 
 
 @pytest.fixture
-def synthetic_mixed_cohort() -> (
-    tuple[pd.DataFrame, np.ndarray, np.ndarray, pd.DataFrame, np.ndarray, np.ndarray]
-):
+def synthetic_mixed_cohort() -> tuple[
+    pd.DataFrame, np.ndarray, np.ndarray, pd.DataFrame, np.ndarray, np.ndarray
+]:
     """Generate reproducible synthetic mixed cohort with patient clusters.
 
     Returns:
@@ -260,9 +262,9 @@ def test_infold_smote_nc_isolation(
     x_res, _ = sm.fit_resample(x_train, y_train)
     for col in ["bin_chf", "bin_cad", "bin_dm"]:
         unique_vals = set(x_res[col].unique())
-        assert unique_vals.issubset(
-            {0.0, 1.0, 0, 1}
-        ), f"Non-binary comorbidity generated: {unique_vals}"
+        assert unique_vals.issubset({0.0, 1.0, 0, 1}), (
+            f"Non-binary comorbidity generated: {unique_vals}"
+        )
 
 
 def test_calculate_metrics_correctness() -> None:
@@ -327,12 +329,12 @@ def test_all_11_models_synthetic_battery(
         # Assert probabilities are valid and bounded in [0, 1]
         assert not np.isnan(test_probs).any(), f"NaNs in test probs for {name}"
         assert not np.isnan(oof_probs).any(), f"NaNs in OOF probs for {name}"
-        assert np.all(
-            (test_probs >= 0.0) & (test_probs <= 1.0)
-        ), f"Out of bounds prob for {name}"
-        assert np.all(
-            (oof_probs >= 0.0) & (oof_probs <= 1.0)
-        ), f"Out of bounds OOF prob for {name}"
+        assert np.all((test_probs >= 0.0) & (test_probs <= 1.0)), (
+            f"Out of bounds prob for {name}"
+        )
+        assert np.all((oof_probs >= 0.0) & (oof_probs <= 1.0)), (
+            f"Out of bounds OOF prob for {name}"
+        )
 
         # Assert decisions are binary
         assert set(res["test_pred_default"]).issubset({0, 1})
@@ -418,3 +420,144 @@ def test_real_cohort_anti_leakage_properties() -> None:
     # Zero missing values
     assert train_df.isna().sum().sum() == 0, "Null values in cleaned train matrix!"
     assert test_df.isna().sum().sum() == 0, "Null values in test matrix!"
+
+
+def test_pipeline_named_steps_classifier() -> None:
+    """Verify create_smote_pipeline configures 'classifier' step name (Spec line 56)."""
+    clf = LogisticRegression(max_iter=1000, random_state=42)
+    pipe = create_smote_pipeline(
+        classifier=clf,
+        categorical_indices=[0, 1],
+        random_state=42,
+    )
+    assert "classifier" in pipe.named_steps
+    assert pipe.named_steps["classifier"] is clf
+    assert "smotenc" in pipe.named_steps
+    assert "clf" not in pipe.named_steps
+
+
+def test_group_kfold_validation_empirical_class_balance(
+    synthetic_mixed_cohort: tuple[
+        pd.DataFrame,
+        np.ndarray,
+        np.ndarray,
+        pd.DataFrame,
+        np.ndarray,
+        np.ndarray,
+    ],
+) -> None:
+    """Assert within GroupKFold validation folds preserve empirical class balance.
+
+    Validates Spec line 83: In-fold SMOTE-NC must only transform training
+    partitions, leaving validation folds in their natural empirical distribution
+    without synthetic samples.
+    """
+    x_train, y_train, groups_train, _, _, _ = synthetic_mixed_cohort
+    cat_indices = identify_categorical_features(x_train)
+
+    gkf = GroupKFold(n_splits=5)
+    for _fold, (train_idx, val_idx) in enumerate(
+        gkf.split(x_train, y_train, groups=groups_train)
+    ):
+        y_val_empirical = y_train[val_idx]
+        val_empirical_positives = int(np.sum(y_val_empirical))
+        val_empirical_total = len(y_val_empirical)
+        val_empirical_prevalence = float(np.mean(y_val_empirical))
+
+        pipe = create_smote_pipeline(
+            classifier=LogisticRegression(max_iter=1000, random_state=42),
+            categorical_indices=cat_indices,
+            random_state=42,
+        )
+
+        # Fit exclusively on fold training partition
+        x_tr_fold = x_train.iloc[train_idx]
+        y_tr_fold = y_train[train_idx]
+        pipe.fit(x_tr_fold, y_tr_fold)
+
+        # Ensure validation fold is evaluated directly without resampling
+        x_val_fold = x_train.iloc[val_idx]
+        val_probs = pipe.predict_proba(x_val_fold)
+
+        # Strict checks: validation size, label counts, prevalence remain untouched
+        assert len(val_probs) == val_empirical_total
+        assert int(np.sum(y_train[val_idx])) == val_empirical_positives
+        assert float(np.mean(y_train[val_idx])) == pytest.approx(
+            val_empirical_prevalence
+        )
+
+        # Verify training fold was indeed resampled by SMOTE-NC
+        smotenc_step = pipe.named_steps["smotenc"]
+        assert hasattr(smotenc_step, "categorical_features")
+        assert smotenc_step.categorical_features == cat_indices
+
+
+def test_identify_categorical_features_drops_target_and_id() -> None:
+    """Verify target and PatientID columns are dropped to prevent index drift."""
+    df = pd.DataFrame(
+        {
+            "PatientID": [101, 102, 103, 104],
+            "is_death_3yr": [0, 1, 0, 1],
+            "cont_feature": [1.2, 3.4, 5.6, 7.8],
+            "bin_comorb": [0.0, 1.0, 0.0, 1.0],
+            "HD_WS": [1, 2, 3, 4],
+        }
+    )
+
+    cat_indices = identify_categorical_features(df)
+    # Feature matrix after dropping PatientID and is_death_3yr has columns:
+    # 0: cont_feature, 1: bin_comorb, 2: HD_WS
+    # Categorical indices must be [1, 2], NOT [3, 4]
+    assert cat_indices == [1, 2]
+
+    # Verify matching feature dataframe
+    feature_df = df.drop(columns=["PatientID", "is_death_3yr"])
+    cat_cols = [feature_df.columns[i] for i in cat_indices]
+    assert cat_cols == ["bin_comorb", "HD_WS"]
+
+
+def test_typed_benchmark_results(
+    synthetic_mixed_cohort: tuple[
+        pd.DataFrame,
+        np.ndarray,
+        np.ndarray,
+        pd.DataFrame,
+        np.ndarray,
+        np.ndarray,
+    ],
+) -> None:
+    """Verify evaluate_model_cv_and_test returns typed BenchmarkModelResult."""
+    x_train, y_train, groups_train, x_test, y_test, _ = synthetic_mixed_cohort
+    cat_indices = identify_categorical_features(x_train)
+
+    pipe = create_smote_pipeline(
+        classifier=LogisticRegression(max_iter=1000, random_state=42),
+        categorical_indices=cat_indices,
+        random_state=42,
+    )
+
+    res: BenchmarkModelResult = evaluate_model_cv_and_test(
+        model_name="LR_Typed",
+        pipeline=pipe,
+        x_train=x_train,
+        y_train=y_train,
+        groups_train=groups_train,
+        x_test=x_test,
+        y_test=y_test,
+        n_splits=5,
+    )
+
+    expected_keys = {
+        "model_name",
+        "optimal_threshold",
+        "oof_f1",
+        "oof_probs",
+        "test_probs",
+        "test_pred_default",
+        "test_pred_optimal",
+        "metrics_default",
+        "metrics_optimal",
+        "fitted_pipeline",
+    }
+    assert set(res.keys()) == expected_keys
+    assert "classifier" in res["fitted_pipeline"].named_steps

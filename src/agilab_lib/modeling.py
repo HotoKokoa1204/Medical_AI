@@ -9,7 +9,7 @@ Description: Benchmark suite and in-fold SMOTE-NC modeling for hemodialysis
 from __future__ import annotations
 
 import logging
-from typing import Any, Sequence
+from typing import Any, Sequence, TypedDict
 
 import numpy as np
 import pandas as pd
@@ -54,6 +54,31 @@ DEFAULT_DISCRETE_COLUMNS: list[str] = [
     "actAssess",
     "Comorb_Count",
 ]
+
+
+class BenchmarkModelResult(TypedDict):
+    """Structured evaluation result container for a single benchmark model."""
+
+    model_name: str
+    optimal_threshold: float
+    oof_f1: float
+    oof_probs: np.ndarray
+    test_probs: np.ndarray
+    test_pred_default: np.ndarray
+    test_pred_optimal: np.ndarray
+    metrics_default: dict[str, float]
+    metrics_optimal: dict[str, float]
+    fitted_pipeline: ImbPipeline
+
+
+class BenchmarkSuiteResult(TypedDict):
+    """Structured evaluation result container for the entire benchmark suite."""
+
+    metrics_df: pd.DataFrame
+    test_predictions_df: pd.DataFrame
+    oof_predictions_df: pd.DataFrame
+    fitted_pipelines: dict[str, ImbPipeline]
+    results: dict[str, BenchmarkModelResult]
 
 
 def get_model_zoo(random_state: int = 42) -> dict[str, BaseEstimator]:
@@ -142,6 +167,8 @@ def identify_categorical_features(
 
     Examines DataFrame columns to locate binary flags (nunique <= 2), object/category
     columns, and known discrete count / schedule columns to configure SMOTE-NC.
+    Target and identifier columns ('is_death_3yr', 'is_death', 'PatientID') are dropped
+    before determining column positions to prevent any index drift.
 
     Args:
         df: Input DataFrame containing feature columns.
@@ -152,15 +179,18 @@ def identify_categorical_features(
     Returns:
         List of 0-based integer column indices corresponding to categorical features.
     """
+    cols_to_drop = [
+        c for c in ("is_death_3yr", "is_death", "PatientID") if c in df.columns
+    ]
+    feature_df = df.drop(columns=cols_to_drop) if cols_to_drop else df
+
     disc_set = set(
         discrete_columns if discrete_columns is not None else DEFAULT_DISCRETE_COLUMNS
     )
     categorical_indices: list[int] = []
 
-    for idx, col in enumerate(df.columns):
-        if col in ("is_death_3yr", "is_death"):
-            continue
-        series = df[col]
+    for idx, col in enumerate(feature_df.columns):
+        series = feature_df[col]
         n_unique = series.nunique()
         is_obj = pd.api.types.is_object_dtype(series) or isinstance(
             series.dtype, pd.CategoricalDtype
@@ -203,7 +233,7 @@ def create_smote_pipeline(
     else:
         resampler = SMOTENC(categorical_features=cat_list, random_state=random_state)
 
-    pipeline = ImbPipeline([("smotenc", resampler), ("clf", classifier)])
+    pipeline = ImbPipeline([("smotenc", resampler), ("classifier", classifier)])
     return pipeline
 
 
@@ -331,7 +361,7 @@ def evaluate_model_cv_and_test(
     x_test: pd.DataFrame,
     y_test: pd.Series | np.ndarray,
     n_splits: int = 5,
-) -> dict[str, Any]:
+) -> BenchmarkModelResult:
     """Execute 5-fold GroupKFold cross-validation, OOF tuning, and test inference.
 
     Args:
@@ -345,7 +375,7 @@ def evaluate_model_cv_and_test(
         n_splits: Number of cross-validation folds (default 5).
 
     Returns:
-        Dictionary containing OOF probabilities, optimal threshold, test
+        BenchmarkModelResult containing OOF probabilities, optimal threshold, test
         probabilities, fitted full pipeline, and metrics under both default
         and optimal thresholds.
     """
@@ -408,7 +438,7 @@ def evaluate_model_cv_and_test(
     metrics_default = calculate_metrics(y_te, test_probs, threshold=0.50)
     metrics_optimal = calculate_metrics(y_te, test_probs, threshold=optimal_threshold)
 
-    result: dict[str, Any] = {
+    result: BenchmarkModelResult = {
         "model_name": model_name,
         "optimal_threshold": optimal_threshold,
         "oof_f1": oof_f1,
@@ -433,7 +463,7 @@ def run_benchmark_suite(
     categorical_indices: Sequence[int] | None = None,
     n_splits: int = 5,
     random_state: int = 42,
-) -> dict[str, Any]:
+) -> BenchmarkSuiteResult:
     """Execute end-to-end benchmark across all models with in-fold SMOTE-NC.
 
     Args:
@@ -449,12 +479,12 @@ def run_benchmark_suite(
         random_state: Random seed for reproducibility.
 
     Returns:
-        Dictionary containing:
+        BenchmarkSuiteResult containing:
             - metrics_df: Comparative DataFrame across all models and metrics.
             - test_predictions_df: Test set probabilities and dual decisions.
             - oof_predictions_df: Training set OOF probabilities.
             - fitted_pipelines: Dict of trained full pipelines per model.
-            - results: Detailed result dictionary per model.
+            - results: Detailed BenchmarkModelResult dictionary per model.
     """
     if models is None:
         models = get_model_zoo(random_state=random_state)
@@ -473,7 +503,7 @@ def run_benchmark_suite(
         "is_death_3yr": y_tr,
     }
     fitted_pipelines: dict[str, ImbPipeline] = {}
-    detailed_results: dict[str, Any] = {}
+    detailed_results: dict[str, BenchmarkModelResult] = {}
 
     for name, estimator in models.items():
         logger.info(f"Training benchmark model: {name}")

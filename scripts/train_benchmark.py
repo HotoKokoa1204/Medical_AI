@@ -335,9 +335,9 @@ def main() -> int:
     print(f"  [OK] Unique Training Patients: {n_unique_patients}")
 
     overlap_patients = set(train_groups).intersection(set(test_groups))
-    assert (
-        len(overlap_patients) == 0
-    ), f"Subject leakage detected: {len(overlap_patients)} overlap!"
+    assert len(overlap_patients) == 0, (
+        f"Subject leakage detected: {len(overlap_patients)} overlap!"
+    )
     print(
         "  [OK] Patient Grouping Isolation Verified: "
         "Train Patients ∩ Test Patients == ∅"
@@ -384,10 +384,14 @@ def main() -> int:
         f"(Shape: {test_pred_df.shape})"
     )
 
-    # Save metrics CSV
+    # Save metrics CSV (data/processed and reports directory)
     metrics_path = output_dir / "benchmark_metrics.csv"
     metrics_df.to_csv(metrics_path, index=False)
     print(f"  [OK] Saved Benchmark Metrics CSV:   {metrics_path}")
+
+    reports_metrics_path = reports_dir / "benchmark_metrics.csv"
+    metrics_df.to_csv(reports_metrics_path, index=False)
+    print(f"  [OK] Saved Reports Metrics CSV:     {reports_metrics_path}")
 
     # Save Markdown Summary
     report_content = generate_markdown_report(metrics_df, len(x_train), len(x_test))
@@ -426,9 +430,17 @@ def main() -> int:
     )
     print(f"  [OK] Generated PR Curves:           {pr_fig_path}")
 
+    # Dynamically select top 3 models by ROC-AUC
+    top_3_names = (
+        metrics_df.sort_values(by="ROC_AUC", ascending=False)["Model"].head(3).tolist()
+    )
+    print(f"  [INFO] Dynamic Top 3 Models:        {top_3_names}")
+
     plot_top_feature_importance(
         models=fitted_pipelines,
-        feature_names=x_train.columns.tolist(),
+        feature_names=x_train,
+        y=y_train,
+        top_models=top_3_names,
         save_path=fi_fig_path,
         dpi=300,
     )

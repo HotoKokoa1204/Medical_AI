@@ -584,6 +584,36 @@ def plot_t2_vs_spe(
     return fig
 
 
+def _parse_model_probabilities(
+    probabilities: dict[str, Sequence[float] | np.ndarray] | pd.DataFrame,
+) -> dict[str, np.ndarray]:
+    """Parse and normalize model name to predicted probability arrays.
+
+    Args:
+        probabilities: Dictionary or DataFrame mapping model names to predicted
+            probabilities.
+
+    Returns:
+        Dictionary mapping model names to float numpy arrays of predicted probabilities.
+    """
+    prob_dict: dict[str, np.ndarray] = {}
+    if isinstance(probabilities, pd.DataFrame):
+        for col in probabilities.columns:
+            if col in ("is_death_3yr", "is_death"):
+                continue
+            if col.endswith("_prob"):
+                name = col[:-5].replace("_", " ").title()
+            elif "_pred" in col:
+                continue
+            else:
+                name = col
+            prob_dict[name] = np.asarray(probabilities[col], dtype=float)
+    else:
+        for name, probs in probabilities.items():
+            prob_dict[name] = np.asarray(probs, dtype=float)
+    return prob_dict
+
+
 def plot_benchmark_roc_curves(
     y_true: Sequence[int] | np.ndarray,
     probabilities: dict[str, Sequence[float] | np.ndarray] | pd.DataFrame,
@@ -605,22 +635,7 @@ def plot_benchmark_roc_curves(
         matplotlib.pyplot.Figure object.
     """
     y_t = np.asarray(y_true, dtype=int)
-
-    prob_dict: dict[str, np.ndarray] = {}
-    if isinstance(probabilities, pd.DataFrame):
-        for col in probabilities.columns:
-            if col in ("is_death_3yr", "is_death"):
-                continue
-            if col.endswith("_prob"):
-                name = col[:-5].replace("_", " ").title()
-            elif "_pred" in col:
-                continue
-            else:
-                name = col
-            prob_dict[name] = np.asarray(probabilities[col], dtype=float)
-    else:
-        for name, probs in probabilities.items():
-            prob_dict[name] = np.asarray(probs, dtype=float)
+    prob_dict = _parse_model_probabilities(probabilities)
 
     # Compute ROC curves and AUCs
     curves: list[tuple[str, np.ndarray, np.ndarray, float]] = []
@@ -709,22 +724,7 @@ def plot_benchmark_pr_curves(
         matplotlib.pyplot.Figure object.
     """
     y_t = np.asarray(y_true, dtype=int)
-
-    prob_dict: dict[str, np.ndarray] = {}
-    if isinstance(probabilities, pd.DataFrame):
-        for col in probabilities.columns:
-            if col in ("is_death_3yr", "is_death"):
-                continue
-            if col.endswith("_prob"):
-                name = col[:-5].replace("_", " ").title()
-            elif "_pred" in col:
-                continue
-            else:
-                name = col
-            prob_dict[name] = np.asarray(probabilities[col], dtype=float)
-    else:
-        for name, probs in probabilities.items():
-            prob_dict[name] = np.asarray(probs, dtype=float)
+    prob_dict = _parse_model_probabilities(probabilities)
 
     # Compute PR curves and PR-AUCs
     curves: list[tuple[str, np.ndarray, np.ndarray, float]] = []
@@ -794,7 +794,8 @@ def plot_benchmark_pr_curves(
 
 def plot_top_feature_importance(
     models: dict[str, Any],
-    feature_names: Sequence[str],
+    feature_names: Sequence[str] | pd.DataFrame,
+    y: Sequence[Any] | None = None,
     top_models: Sequence[str] | None = None,
     top_n: int = 15,
     save_path: Path | str | None = None,
@@ -804,7 +805,9 @@ def plot_top_feature_importance(
 
     Args:
         models: Dictionary mapping model names to fitted pipelines or estimators.
-        feature_names: Names of features corresponding to the model inputs.
+        feature_names: Names of features or DataFrame whose columns define
+            feature names.
+        y: Optional target array (retained for signature compatibility).
         top_models: Sequence of model names to plot. If None, selects up to 3 models
             having feature_importances_ or get_feature_importance().
         top_n: Number of leading features to display per model (default 15).
@@ -814,6 +817,11 @@ def plot_top_feature_importance(
     Returns:
         matplotlib.pyplot.Figure object.
     """
+    if isinstance(feature_names, pd.DataFrame):
+        names = feature_names.columns.tolist()
+    else:
+        names = list(feature_names)
+
     candidate_names: list[str] = []
     if top_models is not None:
         candidate_names = [m for m in top_models if m in models]
@@ -857,8 +865,13 @@ def plot_top_feature_importance(
         ax = axes_flat[idx]
         model_obj = models[name]
 
-        if hasattr(model_obj, "named_steps") and "clf" in model_obj.named_steps:
-            clf = model_obj.named_steps["clf"]
+        if hasattr(model_obj, "named_steps"):
+            if "classifier" in model_obj.named_steps:
+                clf = model_obj.named_steps["classifier"]
+            elif "clf" in model_obj.named_steps:
+                clf = model_obj.named_steps["clf"]
+            else:
+                clf = model_obj
         else:
             clf = model_obj
 
@@ -871,14 +884,12 @@ def plot_top_feature_importance(
                 clf.coef_[0] if clf.coef_.ndim > 1 else clf.coef_
             ).astype(float)
         else:
-            importances = np.zeros(len(feature_names))
+            importances = np.zeros(len(names))
 
         total_imp = np.sum(importances)
         norm_imp = (importances / total_imp * 100.0) if total_imp > 0 else importances
 
-        imp_series = pd.Series(norm_imp, index=list(feature_names)).sort_values(
-            ascending=False
-        )
+        imp_series = pd.Series(norm_imp, index=names).sort_values(ascending=False)
         top_subset = imp_series.head(top_n).iloc[::-1]
 
         y_positions = np.arange(len(top_subset))
