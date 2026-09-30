@@ -14,6 +14,16 @@ from agilab_lib.analysis import (
     prune_multivariate_outliers,
     summarize_components,
 )
+from agilab_lib.modeling import (
+    DEFAULT_DISCRETE_COLUMNS,
+    calculate_metrics,
+    create_smote_pipeline,
+    evaluate_model_cv_and_test,
+    find_optimal_threshold,
+    get_model_zoo,
+    identify_categorical_features,
+    run_benchmark_suite,
+)
 from agilab_lib.preprocessing import (
     DEFAULT_CONTINUOUS_COLUMNS,
     DISCRETE_COUNT_COLUMNS,
@@ -35,10 +45,13 @@ from agilab_lib.preprocessing import (
     split_patient_cohort,
 )
 from agilab_lib.visualization import (
+    plot_benchmark_pr_curves,
+    plot_benchmark_roc_curves,
     plot_pca_loadings_biplot,
     plot_pca_scatter,
     plot_scree,
     plot_t2_vs_spe,
+    plot_top_feature_importance,
 )
 
 __all__ = [
@@ -64,6 +77,16 @@ __all__ = [
     "plot_pca_scatter",
     "plot_pca_loadings_biplot",
     "plot_t2_vs_spe",
+    "plot_benchmark_roc_curves",
+    "plot_benchmark_pr_curves",
+    "plot_top_feature_importance",
+    "get_model_zoo",
+    "identify_categorical_features",
+    "create_smote_pipeline",
+    "find_optimal_threshold",
+    "calculate_metrics",
+    "evaluate_model_cv_and_test",
+    "run_benchmark_suite",
     "TARGET_LEAKAGE_COLUMNS",
     "IDENTIFIER_COLUMNS",
     "LABEL_COLUMN",
@@ -71,4 +94,5 @@ __all__ = [
     "HIGH_MISSING_DROPS",
     "DEFAULT_CONTINUOUS_COLUMNS",
     "DISCRETE_COUNT_COLUMNS",
+    "DEFAULT_DISCRETE_COLUMNS",
 ]
