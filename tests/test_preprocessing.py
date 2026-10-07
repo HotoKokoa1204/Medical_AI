@@ -19,7 +19,6 @@ if src_path not in sys.path:
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import pytest  # noqa: E402
-
 from agilab_lib.analysis import (  # noqa: E402
     calculate_hotelling_t2,
     calculate_spe,
@@ -29,10 +28,14 @@ from agilab_lib.analysis import (  # noqa: E402
     prune_multivariate_outliers,
 )
 from agilab_lib.preprocessing import (  # noqa: E402
+    ASSESSMENT_COLUMNS,
+    CATEGORICAL_COLUMNS,
+    DEFAULT_CONTINUOUS_COLUMNS,
     DISCRETE_COUNT_COLUMNS,
     HIGH_MISSING_DROPS,
     IDENTIFIER_COLUMNS,
     TARGET_LEAKAGE_COLUMNS,
+    ZERO_FILL_INDICATOR_COLUMNS,
     LongitudinalPreprocessor,
     clean_clinical_bounds,
     deterministic_pruning,
@@ -48,6 +51,8 @@ from agilab_lib.visualization import (  # noqa: E402
 )
 
 DATA_PATH = Path("data/Kidit_Master_Baseline_V2.xlsx")
+if not DATA_PATH.exists() and Path("E:/github/Kidit_Master_Baseline_V2.xlsx").exists():
+    DATA_PATH = Path("E:/github/Kidit_Master_Baseline_V2.xlsx")
 
 
 @pytest.fixture
@@ -112,6 +117,14 @@ def sample_raw_dataframe() -> pd.DataFrame:
             "DM": [1, 0, 1, 0],
             "Hypertension": [1, 1, 0, 1],
             "HD_WS": [3, np.nan, 2, 3],
+            "HD_ST": [4.0, np.nan, 3.0, 4.0],
+            "CIC": [3.0, np.nan, 2.0, 3.0],
+            "total_hd_time": [240.0, np.nan, 240.0, 210.0],
+            "txIntervalMin": [2640.0, np.nan, 2880.0, 2640.0],
+            "ID_U": [1250.0, np.nan, 1000.0, 1250.0],
+            "MD_U": [250.0, np.nan, 200.0, 250.0],
+            "genAssess": [5.0, np.nan, 7.0, 3.0],
+            "actAssess": [70.0, np.nan, 90.0, 50.0],
             "Comorb_Count": [2, 1, 1, 1],
         }
     )
@@ -207,6 +220,78 @@ def test_encode_categorical_features(
     assert any(c.startswith("blood_type_") for c in encoded_df.columns)
     assert any("nan" in c.lower() for c in encoded_df.columns)
     assert np.issubdtype(encoded_df.dtypes.iloc[0], np.number)
+
+
+def test_non_mode_imputation_architecture(
+    sample_raw_dataframe: pd.DataFrame,
+) -> None:
+    """Test non-mode imputation rules per Ticket 1 (#4) spec:
+
+    1. genAssess and actAssess: KNN-imputed via distance weights, not mode.
+    2. HD_WS, HD_ST, CIC, total_hd_time, txIntervalMin: OneHotEncoded with _nan columns.
+    3. ID_U and MD_U: Filled with 0.0 and accompanied by _isna binary indicator columns.
+    4. Comorb_Count: Preserved as integer score.
+    """
+    df_clean = clean_clinical_bounds(sample_raw_dataframe)
+    df_eng = engineer_features(df_clean)
+
+    # Verify column vocabulary separation
+    assert "genAssess" not in DISCRETE_COUNT_COLUMNS
+    assert "actAssess" not in DISCRETE_COUNT_COLUMNS
+    assert "HD_WS" not in DISCRETE_COUNT_COLUMNS
+    assert "total_hd_time" not in DEFAULT_CONTINUOUS_COLUMNS
+    assert "txIntervalMin" not in DEFAULT_CONTINUOUS_COLUMNS
+    assert "Comorb_Count" in DISCRETE_COUNT_COLUMNS
+    assert "genAssess" in ASSESSMENT_COLUMNS
+    assert "actAssess" in ASSESSMENT_COLUMNS
+    assert "ID_U" in ZERO_FILL_INDICATOR_COLUMNS
+    assert "MD_U" in ZERO_FILL_INDICATOR_COLUMNS
+
+    for col in ["HD_WS", "HD_ST", "CIC", "total_hd_time", "txIntervalMin"]:
+        assert col in CATEGORICAL_COLUMNS
+
+    preprocessor = LongitudinalPreprocessor()
+    preprocessor.fit(df_eng)
+    cont_df, full_df = preprocessor.transform(df_eng)
+
+    # Invariant: No NaNs in full feature matrix
+    assert full_df.isna().sum().sum() == 0
+
+    # 1. genAssess and actAssess are KNN-imputed (row 1 had NaN, now imputed)
+    assert "genAssess" in full_df.columns
+    assert "actAssess" in full_df.columns
+    assert not pd.isna(full_df.loc[1, "genAssess"])
+    assert not pd.isna(full_df.loc[1, "actAssess"])
+    # Row 0 had genAssess=5.0, actAssess=70.0 (preserved)
+    assert np.isclose(full_df.loc[0, "genAssess"], 5.0)
+    assert np.isclose(full_df.loc[0, "actAssess"], 70.0)
+
+    # 2. HD_WS, CIC, total_hd_time, txIntervalMin have OneHotEncoded columns with _nan
+    assert any(c.startswith("HD_WS_") for c in full_df.columns)
+    assert any(c.startswith("HD_WS_nan") for c in full_df.columns)
+    assert any(c.startswith("CIC_nan") for c in full_df.columns)
+    assert any(c.startswith("total_hd_time_nan") for c in full_df.columns)
+    assert any(c.startswith("txIntervalMin_nan") for c in full_df.columns)
+    # Raw categorical columns must NOT be in continuous PCA matrix
+    for cat_col in ["HD_WS", "HD_ST", "CIC", "total_hd_time", "txIntervalMin"]:
+        assert cat_col not in cont_df.columns
+
+    # 3. ID_U and MD_U are filled with 0.0 and have _isna indicators
+    assert "ID_U" in full_df.columns
+    assert "ID_U_isna" in full_df.columns
+    assert "MD_U" in full_df.columns
+    assert "MD_U_isna" in full_df.columns
+    # Row 1 had NaN -> ID_U=0.0, ID_U_isna=1.0
+    assert full_df.loc[1, "ID_U"] == 0.0
+    assert full_df.loc[1, "ID_U_isna"] == 1.0
+    assert full_df.loc[1, "MD_U"] == 0.0
+    assert full_df.loc[1, "MD_U_isna"] == 1.0
+    # Row 0 had 1250.0 / 250.0 -> ID_U=1250.0, ID_U_isna=0.0
+    assert full_df.loc[0, "ID_U"] == 1250.0
+    assert full_df.loc[0, "ID_U_isna"] == 0.0
+
+    # 4. Comorb_Count is integer
+    assert np.issubdtype(full_df["Comorb_Count"].dtype, np.integer)
 
 
 def test_deterministic_pruning_unit() -> None:
@@ -363,6 +448,25 @@ def test_full_pipeline_train_prune_and_test_invariance() -> None:
             assert np.issubdtype(full_train[disc_col].dtype, np.integer)
         if disc_col in full_test.columns:
             assert np.issubdtype(full_test[disc_col].dtype, np.integer)
+
+    # Invariant 2 (Zero Mode Imputation): Non-mode imputation assertions
+    assert "genAssess" in full_train.columns
+    assert "actAssess" in full_train.columns
+    assert full_train["genAssess"].isna().sum() == 0
+    assert full_test["genAssess"].isna().sum() == 0
+    assert full_train["actAssess"].isna().sum() == 0
+    assert full_test["actAssess"].isna().sum() == 0
+
+    assert any(c.startswith("HD_WS_nan") for c in full_train.columns)
+    assert any(c.startswith("CIC_nan") for c in full_train.columns)
+    for cat_col in ["HD_WS", "HD_ST", "CIC", "total_hd_time", "txIntervalMin"]:
+        assert cat_col not in cont_train.columns
+        assert cat_col not in cont_test.columns
+
+    assert "ID_U_isna" in full_train.columns and "MD_U_isna" in full_train.columns
+    assert "ID_U_isna" in full_test.columns and "MD_U_isna" in full_test.columns
+    assert full_train["ID_U"].isna().sum() == 0
+    assert full_test["ID_U"].isna().sum() == 0
 
     # 4. PCA & Multivariate Outlier Pruning with genuine Jackson-Mudholkar
     pca, scores, _ = fit_pca(cont_train, n_components=5)

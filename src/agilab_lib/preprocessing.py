@@ -13,7 +13,7 @@ from typing import Sequence
 
 import numpy as np
 import pandas as pd
-from sklearn.impute import SimpleImputer
+from sklearn.impute import KNNImputer, SimpleImputer
 from sklearn.model_selection import GroupShuffleSplit
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
@@ -96,11 +96,9 @@ DEFAULT_CONTINUOUS_COLUMNS: list[str] = [
     "Cholesterol",
     "Triglyceride",
     "Glucose_AC",
-    "total_hd_time",
     "before_hd_BUN",
     "after_hd_BUN",
     "nextTxPreBUN",
-    "txIntervalMin",
     "Fe",
     "TIBC",
     "Ferritin",
@@ -116,16 +114,21 @@ DEFAULT_CONTINUOUS_COLUMNS: list[str] = [
     "HD_MSA",
 ]
 
-# Discrete count / schedule features to be imputed via integer mode
+# Discrete count features preserved as integer scores
 DISCRETE_COUNT_COLUMNS: list[str] = [
-    "HD_WS",
-    "HD_ST",
-    "ID_U",
-    "MD_U",
-    "CIC",
+    "Comorb_Count",
+]
+
+# Clinical assessment scores imputed via KNN distance weighting on continuous features
+ASSESSMENT_COLUMNS: list[str] = [
     "genAssess",
     "actAssess",
-    "Comorb_Count",
+]
+
+# Clinical dose features imputed with 0.0 baseline and binary missingness indicators
+ZERO_FILL_INDICATOR_COLUMNS: list[str] = [
+    "ID_U",
+    "MD_U",
 ]
 
 # Comorbidity binary flags (0 missing)
@@ -187,6 +190,11 @@ CATEGORICAL_COLUMNS: list[str] = [
     "IronSupp",
     "HBsAg",
     "Anti_HCV",
+    "HD_WS",
+    "HD_ST",
+    "CIC",
+    "total_hd_time",
+    "txIntervalMin",
 ]
 
 
@@ -490,7 +498,10 @@ class LongitudinalPreprocessor:
         continuous_cols: Sequence[str] | None = None,
         discrete_cols: Sequence[str] | None = None,
         categorical_cols: Sequence[str] | None = None,
+        assessment_cols: Sequence[str] | None = None,
+        zero_fill_cols: Sequence[str] | None = None,
         missing_threshold: float = 0.20,
+        n_knn_neighbors: int = 5,
     ) -> None:
         """Initialize preprocessor with feature types.
 
@@ -498,7 +509,11 @@ class LongitudinalPreprocessor:
             continuous_cols: List of candidate continuous column names.
             discrete_cols: List of discrete count column names.
             categorical_cols: List of categorical column names.
+            assessment_cols: List of clinical assessment column names for
+                KNN imputation.
+            zero_fill_cols: List of feature names to fill with 0.0 and indicator flags.
             missing_threshold: Maximum allowed missing rate for continuous features.
+            n_knn_neighbors: Number of nearest neighbors for KNN imputer (default 5).
         """
         self.continuous_cols_input = (
             list(continuous_cols) if continuous_cols is not None else None
@@ -513,14 +528,30 @@ class LongitudinalPreprocessor:
             if categorical_cols is not None
             else list(CATEGORICAL_COLUMNS)
         )
+        self.assessment_cols_input = (
+            list(assessment_cols)
+            if assessment_cols is not None
+            else list(ASSESSMENT_COLUMNS)
+        )
+        self.zero_fill_cols_input = (
+            list(zero_fill_cols)
+            if zero_fill_cols is not None
+            else list(ZERO_FILL_INDICATOR_COLUMNS)
+        )
         self.missing_threshold = missing_threshold
+        self.n_knn_neighbors = n_knn_neighbors
 
         self.retained_cont_cols: list[str] = []
         self.retained_disc_cols: list[str] = []
         self.retained_cat_cols: list[str] = []
+        self.retained_assess_cols: list[str] = []
+        self.retained_zero_fill_cols: list[str] = []
 
         self.cont_imputer: SimpleImputer = SimpleImputer(strategy="median")
         self.scaler: StandardScaler = StandardScaler()
+        self.knn_imputer: KNNImputer = KNNImputer(
+            n_neighbors=self.n_knn_neighbors, weights="distance"
+        )
         self.discrete_modes: dict[str, int] = {}
         self.sex_mode: float = 1.0
         self.ohe: OneHotEncoder = OneHotEncoder(
@@ -549,6 +580,9 @@ class LongitudinalPreprocessor:
             if c in df.columns
             and c not in HIGH_MISSING_DROPS
             and c not in self.discrete_cols_input
+            and c not in self.assessment_cols_input
+            and c not in self.zero_fill_cols_input
+            and c not in self.categorical_cols_input
             and df[c].isna().mean() <= self.missing_threshold
         ]
 
@@ -564,8 +598,27 @@ class LongitudinalPreprocessor:
                 cont_imp_df[col] = np.log1p(cont_imp_df[col].clip(lower=0))
 
         self.scaler.fit(cont_imp_df)
+        scaled_cont_train = pd.DataFrame(
+            self.scaler.transform(cont_imp_df),
+            columns=self.retained_cont_cols,
+            index=df.index,
+        )
 
-        # 2. Discrete Features: Integer mode
+        # 2. Assessment Features: KNNImputer fitted on continuous features + assessments
+        self.retained_assess_cols = [
+            c for c in self.assessment_cols_input if c in df.columns
+        ]
+        if self.retained_assess_cols:
+            assess_train = df[self.retained_assess_cols].apply(
+                pd.to_numeric, errors="coerce"
+            )
+            if self.retained_cont_cols:
+                knn_train_data = pd.concat([scaled_cont_train, assess_train], axis=1)
+            else:
+                knn_train_data = assess_train
+            self.knn_imputer.fit(knn_train_data)
+
+        # 3. Discrete Features: Integer mode
         self.retained_disc_cols = [
             c for c in self.discrete_cols_input if c in df.columns
         ]
@@ -574,14 +627,19 @@ class LongitudinalPreprocessor:
             mode_val = int(non_null.mode().iloc[0]) if not non_null.empty else 0
             self.discrete_modes[col] = mode_val
 
-        # 3. Sex: Mode imputation
+        # 4. Zero-Fill Features (ID_U, MD_U)
+        self.retained_zero_fill_cols = [
+            c for c in self.zero_fill_cols_input if c in df.columns
+        ]
+
+        # 5. Sex: Mode imputation
         if "sex" in df.columns:
             non_null_sex = df["sex"].dropna()
             self.sex_mode = (
                 float(non_null_sex.mode().iloc[0]) if not non_null_sex.empty else 1.0
             )
 
-        # 4. Categorical Features: OneHotEncoder
+        # 6. Categorical Features: OneHotEncoder
         self.retained_cat_cols = [
             c for c in self.categorical_cols_input if c in df.columns
         ]
@@ -624,21 +682,57 @@ class LongitudinalPreprocessor:
             scaled_arr, columns=self.retained_cont_cols, index=df.index
         )
 
-        # 2. Transform Discrete Count Features
+        # 2. Transform Assessment Features via KNNImputer
+        if self.retained_assess_cols:
+            assess_subset = pd.DataFrame(index=df.index)
+            for col in self.retained_assess_cols:
+                if col in df.columns:
+                    assess_subset[col] = pd.to_numeric(df[col], errors="coerce")
+                else:
+                    assess_subset[col] = np.nan
+            if self.retained_cont_cols:
+                knn_input_data = pd.concat([continuous_pca_df, assess_subset], axis=1)
+            else:
+                knn_input_data = assess_subset
+            imputed_knn_arr = self.knn_imputer.transform(knn_input_data)
+            imputed_assess_arr = imputed_knn_arr[:, -len(self.retained_assess_cols) :]
+            assess_df = pd.DataFrame(
+                imputed_assess_arr,
+                columns=self.retained_assess_cols,
+                index=df.index,
+            )
+        else:
+            assess_df = pd.DataFrame(index=df.index)
+
+        # 3. Transform Discrete Count Features
         discrete_dict: dict[str, pd.Series] = {}
         for col in self.retained_disc_cols:
             mode_val = self.discrete_modes.get(col, 0)
             discrete_dict[col] = df[col].fillna(mode_val).astype(int)
         discrete_df = pd.DataFrame(discrete_dict, index=df.index)
 
-        # 3. Transform Sex
+        # 4. Transform Zero-Fill Features with Indicator Columns
+        zero_fill_dict: dict[str, pd.Series] = {}
+        for col in self.retained_zero_fill_cols:
+            if col in df.columns:
+                s = pd.to_numeric(df[col], errors="coerce")
+                is_na = s.isna().astype(float)
+                filled = s.fillna(0.0).astype(float)
+            else:
+                is_na = pd.Series(1.0, index=df.index, dtype=float)
+                filled = pd.Series(0.0, index=df.index, dtype=float)
+            zero_fill_dict[col] = filled
+            zero_fill_dict[f"{col}_isna"] = is_na
+        zero_fill_df = pd.DataFrame(zero_fill_dict, index=df.index)
+
+        # 5. Transform Sex
         if "sex" in df.columns:
             sex_series = df["sex"].fillna(self.sex_mode).astype(float)
         else:
             sex_series = pd.Series(self.sex_mode, index=df.index, name="sex")
         sex_df = pd.DataFrame({"sex": sex_series}, index=df.index)
 
-        # 4. Transform Categorical Features via OneHotEncoder
+        # 6. Transform Categorical Features via OneHotEncoder
         cat_subset = df[self.retained_cat_cols].astype(str)
         cat_encoded_arr = self.ohe.transform(cat_subset)
         cat_feature_names = self.ohe.get_feature_names_out(self.retained_cat_cols)
@@ -646,14 +740,14 @@ class LongitudinalPreprocessor:
             cat_encoded_arr, columns=cat_feature_names, index=df.index
         )
 
-        # 5. Comorbidities (0 missing, numeric)
+        # 7. Comorbidities (0 missing, numeric)
         comorb_present = [c for c in COMORBIDITY_COLUMNS if c in df.columns]
         if comorb_present:
             comorb_df = df[comorb_present].astype(float)
         else:
             comorb_df = pd.DataFrame(index=df.index)
 
-        # 6. Extra clinical indicators
+        # 8. Extra clinical indicators
         extra_flags: dict[str, pd.Series] = {}
         if "is_extreme_hypokalemia" in df.columns:
             extra_flags["is_extreme_hypokalemia"] = df["is_extreme_hypokalemia"].astype(
@@ -667,12 +761,18 @@ class LongitudinalPreprocessor:
 
         # Combine into full feature matrix without duplicate column names
         cont_cols_for_full = [
-            c for c in self.retained_cont_cols if c not in self.retained_disc_cols
+            c
+            for c in self.retained_cont_cols
+            if c not in self.retained_disc_cols
+            and c not in self.retained_assess_cols
+            and c not in self.retained_zero_fill_cols
         ]
         full_feature_df = pd.concat(
             [
                 continuous_pca_df[cont_cols_for_full],
+                assess_df,
                 discrete_df,
+                zero_fill_df,
                 sex_df,
                 categorical_df,
                 comorb_df,
@@ -800,6 +900,11 @@ def encode_categorical_features(df: pd.DataFrame) -> pd.DataFrame:
             "CKD",
             "Hx_HD",
             "Hx_PD",
+            "HD_WS",
+            "HD_ST",
+            "CIC",
+            "total_hd_time",
+            "txIntervalMin",
         ]
         if col in df_cat.columns
     ]
