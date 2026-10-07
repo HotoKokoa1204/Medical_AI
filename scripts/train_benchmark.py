@@ -88,7 +88,7 @@ def parse_args() -> argparse.Namespace:
         "--n-splits",
         type=int,
         default=5,
-        help="Number of GroupKFold cross-validation folds (default 5).",
+        help="Number of cross-validation folds (default 5).",
     )
     parser.add_argument(
         "--random-state",
@@ -142,8 +142,11 @@ def load_patient_groups(
     # Fallback to workbook if mapping not found
     workbook_candidates = [
         root / "data" / "Kidit_Master_Baseline_V2.xlsx",
-        Path("E:/github/Kidit_Master_Baseline_V2.xlsx"),
-        Path("E:/github/MedicalAI/data/Kidit_Master_Baseline_V2.xlsx"),
+        root.parent.parent
+        / "AGILAB_MedicalAI"
+        / "data"
+        / "Kidit_Master_Baseline_V2.xlsx",
+        root.parent.parent / "data" / "Kidit_Master_Baseline_V2.xlsx",
     ]
     for wb in workbook_candidates:
         if wb.exists():
@@ -189,7 +192,7 @@ def generate_markdown_report(
         "- **Cohort**: Longitudinal Hemodialysis Rolling 3-Year Dynamic Cohort",
         f"- **Training Records**: {n_train:,} observations (purified via $T^2$ & SPE)",
         f"- **Uncurated Test Records**: {n_test:,} observations (100% unpruned)",
-        "- **Validation Scheme**: 5-Fold `GroupKFold` strictly by `PatientID`",
+        "- **Validation Scheme**: 5-Fold Stratified Group Partition (`PatientID`)",
         "- **Resampling**: In-Fold `SMOTE-NC` (mode for discrete flags)",
         "- **Threshold Calibration**: Optimal cutoff $T^* \\in [0.05, 0.95]$ on OOF",
         "- **Blinding Principle**: Test labels isolated and untouched",
@@ -228,6 +231,7 @@ def generate_markdown_report(
             "- [x] Patient isolation: Train $\\cap$ Test patient IDs = $\\emptyset$.",
             "- [x] In-fold SMOTE-NC: Resampling strictly inside CV training folds.",
             "- [x] Out-of-fold threshold: $T^*$ selected purely on OOF probabilities.",
+            "- [x] Static fold consumption: 5-fold partition with zero leakage.",
             "",
         ]
     )
@@ -306,9 +310,21 @@ def main() -> int:
     test_df = pd.read_parquet(test_path)
 
     target_col = "is_death_3yr" if "is_death_3yr" in train_df.columns else "is_death"
-    x_train = train_df.drop(columns=[target_col])
+
+    # Require static fold assignments in training parquet
+    if "fold" not in train_df.columns:
+        raise ValueError(
+            f"Training dataset at {train_path} must contain static 'fold' column."
+        )
+    train_folds = train_df["fold"].values
+
+    # Strict feature quarantine: drop targets, PatientID, and fold
+    drop_tr = [c for c in (target_col, "PatientID", "fold") if c in train_df.columns]
+    x_train = train_df.drop(columns=drop_tr)
     y_train = train_df[target_col].values
-    x_test = test_df.drop(columns=[target_col])
+
+    drop_te = [c for c in (target_col, "PatientID", "fold") if c in test_df.columns]
+    x_test = test_df.drop(columns=drop_te)
     y_test = test_df[target_col].values
 
     print(
@@ -323,7 +339,7 @@ def main() -> int:
     # Anti-leakage sample count check
     assert len(test_df) == 1112, f"Expected 1,112 test samples, got {len(test_df)}"
 
-    # 2. Resolve Patient Identifiers for GroupKFold
+    # 2. Resolve Patient Identifiers for Group Validation & Leakage Verification
     print("\n[Step 2/5] Resolving patient identifier groupings...")
     train_groups, test_groups = load_patient_groups(
         train_df,
@@ -343,6 +359,10 @@ def main() -> int:
         "Train Patients ∩ Test Patients == ∅"
     )
 
+    if train_folds is not None:
+        n_folds = len(np.unique(train_folds))
+        print(f"  [OK] Static Folds Detected: {n_folds} folds consumed from dataset.")
+
     # 3. Categorical Feature Identification
     print("\n[Step 3/5] Dynamically identifying categorical & discrete indices...")
     cat_indices = identify_categorical_features(x_train)
@@ -352,9 +372,10 @@ def main() -> int:
     )
 
     # 4. Execute 11-Algorithm Benchmark
+    scheme_str = f"{args.n_splits}-Fold Static CV"
     print(
         f"\n[Step 4/5] Executing 11-Model Benchmark Suite "
-        f"({args.n_splits}-Fold GroupKFold CV + In-Fold SMOTE-NC)..."
+        f"({scheme_str} + In-Fold SMOTE-NC)..."
     )
     models = get_model_zoo(random_state=args.random_state)
     results = run_benchmark_suite(
@@ -367,14 +388,24 @@ def main() -> int:
         categorical_indices=cat_indices,
         n_splits=args.n_splits,
         random_state=args.random_state,
+        folds_train=train_folds,
     )
 
     metrics_df = results["metrics_df"]
     test_pred_df = results["test_predictions_df"]
+    oof_pred_df = results["oof_predictions_df"]
     fitted_pipelines = results["fitted_pipelines"]
 
     # 5. Persist Deliverables
     print("\n[Step 5/5] Persisting model predictions, checkpoints, and figures...")
+
+    # Save OOF predictions parquet
+    oof_pred_path = output_dir / "model_predictions_oof.parquet"
+    oof_pred_df.to_parquet(oof_pred_path, engine="pyarrow", index=True)
+    print(
+        f"  [OK] Saved OOF Predictions Matrix:  {oof_pred_path} "
+        f"(Shape: {oof_pred_df.shape})"
+    )
 
     # Save test predictions parquet
     pred_path = output_dir / "model_predictions_test.parquet"

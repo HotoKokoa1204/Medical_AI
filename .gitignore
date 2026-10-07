@@ -65,6 +65,7 @@ venv.bak/
 # Tools
 .ruff_cache/
 .pytest_cache/
+.scratch/
 .mypy_cache/
 
 # CatBoost

@@ -21,9 +21,10 @@ import pandas as pd  # noqa: E402
 import pytest  # noqa: E402
 from imblearn.over_sampling import SMOTENC  # noqa: E402
 from sklearn.linear_model import LogisticRegression  # noqa: E402
-from sklearn.model_selection import GroupKFold  # noqa: E402
+from sklearn.model_selection import StratifiedGroupKFold  # noqa: E402
 
 from agilab_lib.modeling import (  # noqa: E402
+    QUARANTINE_COLUMNS,
     BenchmarkModelResult,
     calculate_metrics,
     create_smote_pipeline,
@@ -100,6 +101,41 @@ def synthetic_mixed_cohort() -> tuple[
     return x_train, y_train, groups_train, x_test, y_test, groups_test
 
 
+@pytest.fixture
+def synthetic_partitioned_cohort(
+    synthetic_mixed_cohort: tuple[
+        pd.DataFrame,
+        np.ndarray,
+        np.ndarray,
+        pd.DataFrame,
+        np.ndarray,
+        np.ndarray,
+    ],
+) -> tuple[
+    pd.DataFrame,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    pd.DataFrame,
+    np.ndarray,
+    np.ndarray,
+]:
+    """Generate synthetic cohort with pre-computed static fold assignments.
+
+    Returns:
+        Tuple of (x_train, y_train, groups_train, folds_train,
+        x_test, y_test, groups_test).
+    """
+    x_train, y_train, groups_train, x_test, y_test, groups_test = synthetic_mixed_cohort
+    sgkf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
+    folds_train = np.zeros(len(y_train), dtype=int)
+    for fold_idx, (_, val_idx) in enumerate(
+        sgkf.split(x_train, y_train, groups=groups_train)
+    ):
+        folds_train[val_idx] = fold_idx
+    return x_train, y_train, groups_train, folds_train, x_test, y_test, groups_test
+
+
 def test_identify_categorical_features(
     synthetic_mixed_cohort: tuple[
         pd.DataFrame,
@@ -145,8 +181,9 @@ def test_find_optimal_threshold() -> None:
 
 
 def test_oof_threshold_independence_from_test_labels(
-    synthetic_mixed_cohort: tuple[
+    synthetic_partitioned_cohort: tuple[
         pd.DataFrame,
+        np.ndarray,
         np.ndarray,
         np.ndarray,
         pd.DataFrame,
@@ -155,7 +192,9 @@ def test_oof_threshold_independence_from_test_labels(
     ],
 ) -> None:
     """Assert OOF threshold selection is completely independent of test labels."""
-    x_train, y_train, groups_train, x_test, y_test, _ = synthetic_mixed_cohort
+    x_train, y_train, groups_train, folds_train, x_test, y_test, _ = (
+        synthetic_partitioned_cohort
+    )
     cat_indices = identify_categorical_features(x_train)
 
     pipe = create_smote_pipeline(
@@ -164,7 +203,7 @@ def test_oof_threshold_independence_from_test_labels(
         random_state=42,
     )
 
-    # Run with original test labels
+    # Run with original test labels and static folds
     res_orig = evaluate_model_cv_and_test(
         model_name="LR_Test",
         pipeline=pipe,
@@ -174,6 +213,7 @@ def test_oof_threshold_independence_from_test_labels(
         x_test=x_test,
         y_test=y_test,
         n_splits=5,
+        folds_train=folds_train,
     )
 
     # Invert all test labels entirely
@@ -187,6 +227,7 @@ def test_oof_threshold_independence_from_test_labels(
         x_test=x_test,
         y_test=y_test_inverted,
         n_splits=5,
+        folds_train=folds_train,
     )
 
     # Optimal threshold T* MUST be strictly identical regardless of test labels!
@@ -195,9 +236,10 @@ def test_oof_threshold_independence_from_test_labels(
     assert np.allclose(res_orig["oof_probs"], res_inv["oof_probs"])
 
 
-def test_group_kfold_patient_isolation(
-    synthetic_mixed_cohort: tuple[
+def test_static_fold_patient_isolation(
+    synthetic_partitioned_cohort: tuple[
         pd.DataFrame,
+        np.ndarray,
         np.ndarray,
         np.ndarray,
         pd.DataFrame,
@@ -205,13 +247,12 @@ def test_group_kfold_patient_isolation(
         np.ndarray,
     ],
 ) -> None:
-    """Assert GroupKFold guarantees zero patient identity overlap across folds."""
-    x_train, y_train, groups_train, _, _, _ = synthetic_mixed_cohort
-    gkf = GroupKFold(n_splits=5)
+    """Assert static folds guarantee zero patient identity overlap across folds."""
+    x_train, y_train, groups_train, folds_train, _, _, _ = synthetic_partitioned_cohort
 
-    for fold, (train_idx, val_idx) in enumerate(
-        gkf.split(x_train, y_train, groups=groups_train)
-    ):
+    for fold in range(5):
+        train_idx = np.where(folds_train != fold)[0]
+        val_idx = np.where(folds_train == fold)[0]
         train_pids = set(groups_train[train_idx])
         val_pids = set(groups_train[val_idx])
         overlap = train_pids.intersection(val_pids)
@@ -219,8 +260,9 @@ def test_group_kfold_patient_isolation(
 
 
 def test_infold_smote_nc_isolation(
-    synthetic_mixed_cohort: tuple[
+    synthetic_partitioned_cohort: tuple[
         pd.DataFrame,
+        np.ndarray,
         np.ndarray,
         np.ndarray,
         pd.DataFrame,
@@ -229,7 +271,9 @@ def test_infold_smote_nc_isolation(
     ],
 ) -> None:
     """Assert in-fold SMOTE-NC never alters validation folds or test set."""
-    x_train, y_train, groups_train, x_test, y_test, _ = synthetic_mixed_cohort
+    x_train, y_train, groups_train, folds_train, x_test, y_test, _ = (
+        synthetic_partitioned_cohort
+    )
     cat_indices = identify_categorical_features(x_train)
 
     initial_test_len = len(x_test)
@@ -250,6 +294,7 @@ def test_infold_smote_nc_isolation(
         x_test=x_test,
         y_test=y_test,
         n_splits=5,
+        folds_train=folds_train,
     )
 
     # Test set must remain strictly untouched
@@ -264,6 +309,134 @@ def test_infold_smote_nc_isolation(
         unique_vals = set(x_res[col].unique())
         assert unique_vals.issubset({0.0, 1.0, 0, 1}), (
             f"Non-binary comorbidity generated: {unique_vals}"
+        )
+
+
+def test_static_fold_consumption(
+    synthetic_partitioned_cohort: tuple[
+        pd.DataFrame,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        pd.DataFrame,
+        np.ndarray,
+        np.ndarray,
+    ],
+) -> None:
+    """Verify evaluate_model_cv_and_test directly consumes static fold assignments."""
+    x_train, y_train, groups_train, folds_train, x_test, y_test, _ = (
+        synthetic_partitioned_cohort
+    )
+    cat_indices = identify_categorical_features(x_train)
+    pipe = create_smote_pipeline(
+        classifier=LogisticRegression(max_iter=1000, random_state=42),
+        categorical_indices=cat_indices,
+        random_state=42,
+    )
+
+    res = evaluate_model_cv_and_test(
+        model_name="Static_Fold_Test",
+        pipeline=pipe,
+        x_train=x_train,
+        y_train=y_train,
+        groups_train=groups_train,
+        x_test=x_test,
+        y_test=y_test,
+        n_splits=5,
+        folds_train=folds_train,
+    )
+
+    assert len(res["oof_probs"]) == len(y_train)
+    assert not np.isnan(res["oof_probs"]).any()
+    assert 0.05 <= res["optimal_threshold"] <= 0.95
+    assert not np.isnan(res["test_probs"]).any()
+
+
+def test_feature_quarantine_fold_and_metadata_columns(
+    synthetic_partitioned_cohort: tuple[
+        pd.DataFrame,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        pd.DataFrame,
+        np.ndarray,
+        np.ndarray,
+    ],
+) -> None:
+    """Verify fold and metadata columns in x_train are quarantined."""
+    x_train, y_train, groups_train, folds_train, x_test, y_test, _ = (
+        synthetic_partitioned_cohort
+    )
+    x_train_embedded = x_train.copy()
+    x_train_embedded["fold"] = folds_train
+    x_train_embedded["PatientID"] = groups_train
+    x_train_embedded["is_death_3yr"] = y_train
+
+    x_test_embedded = x_test.copy()
+    x_test_embedded["fold"] = 0
+    x_test_embedded["PatientID"] = 999
+    x_test_embedded["is_death_3yr"] = y_test
+
+    models = {"Logistic Regression": LogisticRegression(max_iter=1000, random_state=42)}
+
+    results = run_benchmark_suite(
+        x_train=x_train_embedded,
+        y_train=y_train,
+        x_test=x_test_embedded,
+        y_test=y_test,
+        models=models,
+        n_splits=5,
+        random_state=42,
+    )
+
+    fitted_pipe = results["fitted_pipelines"]["Logistic Regression"]
+    clf = fitted_pipe.named_steps["classifier"]
+    expected_n_features = x_train.shape[1]
+    assert clf.n_features_in_ == expected_n_features
+    if hasattr(clf, "feature_names_in_"):
+        assert "fold" not in clf.feature_names_in_
+        assert "PatientID" not in clf.feature_names_in_
+        assert "is_death_3yr" not in clf.feature_names_in_
+
+
+def test_static_folds_patient_leakage_assertion(
+    synthetic_partitioned_cohort: tuple[
+        pd.DataFrame,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        pd.DataFrame,
+        np.ndarray,
+        np.ndarray,
+    ],
+) -> None:
+    """Verify runtime error is raised if static folds leak patient identities."""
+    x_train, y_train, groups_train, folds_train, x_test, y_test, _ = (
+        synthetic_partitioned_cohort
+    )
+    corrupted_folds = folds_train.copy()
+    patient_1_idx = np.where(groups_train == 1)[0]
+    corrupted_folds[patient_1_idx[: len(patient_1_idx) // 2]] = 0
+    corrupted_folds[patient_1_idx[len(patient_1_idx) // 2 :]] = 1
+
+    cat_indices = identify_categorical_features(x_train)
+    pipe = create_smote_pipeline(
+        classifier=LogisticRegression(max_iter=1000, random_state=42),
+        categorical_indices=cat_indices,
+        random_state=42,
+    )
+
+    with pytest.raises(RuntimeError, match="Subject leakage detected"):
+        evaluate_model_cv_and_test(
+            model_name="Leakage_Check",
+            pipeline=pipe,
+            x_train=x_train,
+            y_train=y_train,
+            groups_train=groups_train,
+            x_test=x_test,
+            y_test=y_test,
+            n_splits=5,
+            folds_train=corrupted_folds,
         )
 
 
@@ -288,8 +461,9 @@ def test_calculate_metrics_correctness() -> None:
 
 
 def test_all_11_models_synthetic_battery(
-    synthetic_mixed_cohort: tuple[
+    synthetic_partitioned_cohort: tuple[
         pd.DataFrame,
+        np.ndarray,
         np.ndarray,
         np.ndarray,
         pd.DataFrame,
@@ -297,8 +471,10 @@ def test_all_11_models_synthetic_battery(
         np.ndarray,
     ],
 ) -> None:
-    """Verify all 11 models train, predict valid probabilities, and compute metrics."""
-    x_train, y_train, groups_train, x_test, y_test, _ = synthetic_mixed_cohort
+    """Verify Invariant 7: all 11 models train on static folds."""
+    x_train, y_train, groups_train, folds_train, x_test, y_test, _ = (
+        synthetic_partitioned_cohort
+    )
     cat_indices = identify_categorical_features(x_train)
 
     models = get_model_zoo(random_state=42)
@@ -321,6 +497,7 @@ def test_all_11_models_synthetic_battery(
             x_test=x_test,
             y_test=y_test,
             n_splits=5,
+            folds_train=folds_train,
         )
 
         test_probs = res["test_probs"]
@@ -336,6 +513,12 @@ def test_all_11_models_synthetic_battery(
             f"Out of bounds OOF prob for {name}"
         )
 
+        # Assert threshold calibration
+        assert 0.05 <= res["optimal_threshold"] <= 0.95, (
+            f"Threshold out of bounds for {name}"
+        )
+        assert not np.isnan(res["oof_f1"])
+
         # Assert decisions are binary
         assert set(res["test_pred_default"]).issubset({0, 1})
         assert set(res["test_pred_optimal"]).issubset({0, 1})
@@ -347,8 +530,9 @@ def test_all_11_models_synthetic_battery(
 
 
 def test_visualizations_battery(
-    synthetic_mixed_cohort: tuple[
+    synthetic_partitioned_cohort: tuple[
         pd.DataFrame,
+        np.ndarray,
         np.ndarray,
         np.ndarray,
         pd.DataFrame,
@@ -357,7 +541,9 @@ def test_visualizations_battery(
     ],
 ) -> None:
     """Verify publication visualization routines generate valid figures."""
-    x_train, y_train, groups_train, x_test, y_test, _ = synthetic_mixed_cohort
+    x_train, y_train, groups_train, folds_train, x_test, y_test, _ = (
+        synthetic_partitioned_cohort
+    )
     cat_indices = identify_categorical_features(x_train)
 
     # Run lightweight benchmark
@@ -374,6 +560,7 @@ def test_visualizations_battery(
         models=models,
         categorical_indices=cat_indices,
         n_splits=5,
+        folds_train=folds_train,
     )
 
     test_pred_df = benchmark_res["test_predictions_df"]
@@ -411,11 +598,12 @@ def test_real_cohort_anti_leakage_properties() -> None:
     assert len(train_df) == 3737, f"Expected 3,737 train rows, got {len(train_df)}"
     assert len(test_df) == 1112, f"Expected 1,112 test rows, got {len(test_df)}"
 
-    # Feature column parity
-    target = "is_death_3yr"
-    train_features = [c for c in train_df.columns if c != target]
-    test_features = [c for c in test_df.columns if c != target]
+    # Feature column parity (quarantining targets and fold metadata)
+    train_features = [c for c in train_df.columns if c not in QUARANTINE_COLUMNS]
+    test_features = [c for c in test_df.columns if c not in QUARANTINE_COLUMNS]
     assert train_features == test_features, "Feature mismatch between train and test!"
+    assert "fold" in train_df.columns, "Train set must contain fold column!"
+    assert "fold" not in test_df.columns, "Test set must not contain fold column!"
 
     # Zero missing values
     assert train_df.isna().sum().sum() == 0, "Null values in cleaned train matrix!"
@@ -436,9 +624,10 @@ def test_pipeline_named_steps_classifier() -> None:
     assert "clf" not in pipe.named_steps
 
 
-def test_group_kfold_validation_empirical_class_balance(
-    synthetic_mixed_cohort: tuple[
+def test_static_fold_validation_empirical_class_balance(
+    synthetic_partitioned_cohort: tuple[
         pd.DataFrame,
+        np.ndarray,
         np.ndarray,
         np.ndarray,
         pd.DataFrame,
@@ -446,19 +635,18 @@ def test_group_kfold_validation_empirical_class_balance(
         np.ndarray,
     ],
 ) -> None:
-    """Assert within GroupKFold validation folds preserve empirical class balance.
+    """Assert validation folds preserve empirical class balance under static folds.
 
     Validates Spec line 83: In-fold SMOTE-NC must only transform training
     partitions, leaving validation folds in their natural empirical distribution
     without synthetic samples.
     """
-    x_train, y_train, groups_train, _, _, _ = synthetic_mixed_cohort
+    x_train, y_train, groups_train, folds_train, _, _, _ = synthetic_partitioned_cohort
     cat_indices = identify_categorical_features(x_train)
 
-    gkf = GroupKFold(n_splits=5)
-    for _fold, (train_idx, val_idx) in enumerate(
-        gkf.split(x_train, y_train, groups=groups_train)
-    ):
+    for _fold in range(5):
+        train_idx = np.where(folds_train != _fold)[0]
+        val_idx = np.where(folds_train == _fold)[0]
         y_val_empirical = y_train[val_idx]
         val_empirical_positives = int(np.sum(y_val_empirical))
         val_empirical_total = len(y_val_empirical)
@@ -493,10 +681,11 @@ def test_group_kfold_validation_empirical_class_balance(
 
 
 def test_identify_categorical_features_drops_target_and_id() -> None:
-    """Verify target and PatientID columns are dropped to prevent index drift."""
+    """Verify target, PatientID, and fold columns are dropped to prevent index drift."""
     df = pd.DataFrame(
         {
             "PatientID": [101, 102, 103, 104],
+            "fold": [0, 1, 2, 3],
             "is_death_3yr": [0, 1, 0, 1],
             "cont_feature": [1.2, 3.4, 5.6, 7.8],
             "bin_comorb": [0.0, 1.0, 0.0, 1.0],
@@ -505,20 +694,21 @@ def test_identify_categorical_features_drops_target_and_id() -> None:
     )
 
     cat_indices = identify_categorical_features(df)
-    # Feature matrix after dropping PatientID and is_death_3yr has columns:
+    # Feature matrix after dropping PatientID, fold, and is_death_3yr has columns:
     # 0: cont_feature, 1: bin_comorb, 2: HD_WS
     # Categorical indices must be [1, 2], NOT [3, 4]
     assert cat_indices == [1, 2]
 
     # Verify matching feature dataframe
-    feature_df = df.drop(columns=["PatientID", "is_death_3yr"])
+    feature_df = df.drop(columns=["PatientID", "fold", "is_death_3yr"])
     cat_cols = [feature_df.columns[i] for i in cat_indices]
     assert cat_cols == ["bin_comorb", "HD_WS"]
 
 
 def test_typed_benchmark_results(
-    synthetic_mixed_cohort: tuple[
+    synthetic_partitioned_cohort: tuple[
         pd.DataFrame,
+        np.ndarray,
         np.ndarray,
         np.ndarray,
         pd.DataFrame,
@@ -527,7 +717,9 @@ def test_typed_benchmark_results(
     ],
 ) -> None:
     """Verify evaluate_model_cv_and_test returns typed BenchmarkModelResult."""
-    x_train, y_train, groups_train, x_test, y_test, _ = synthetic_mixed_cohort
+    x_train, y_train, groups_train, folds_train, x_test, y_test, _ = (
+        synthetic_partitioned_cohort
+    )
     cat_indices = identify_categorical_features(x_train)
 
     pipe = create_smote_pipeline(
@@ -545,6 +737,7 @@ def test_typed_benchmark_results(
         x_test=x_test,
         y_test=y_test,
         n_splits=5,
+        folds_train=folds_train,
     )
 
     expected_keys = {
@@ -561,3 +754,48 @@ def test_typed_benchmark_results(
     }
     assert set(res.keys()) == expected_keys
     assert "classifier" in res["fitted_pipeline"].named_steps
+
+
+def test_static_folds_required_raises_error(
+    synthetic_mixed_cohort: tuple[
+        pd.DataFrame,
+        np.ndarray,
+        np.ndarray,
+        pd.DataFrame,
+        np.ndarray,
+        np.ndarray,
+    ],
+) -> None:
+    """Verify ValueError is raised when static folds are not provided."""
+    x_train, y_train, groups_train, x_test, y_test, _ = synthetic_mixed_cohort
+    cat_indices = identify_categorical_features(x_train)
+
+    pipe = create_smote_pipeline(
+        classifier=LogisticRegression(max_iter=1000, random_state=42),
+        categorical_indices=cat_indices,
+        random_state=42,
+    )
+
+    with pytest.raises(ValueError, match="Static folds must be provided"):
+        evaluate_model_cv_and_test(
+            model_name="LR_No_Folds",
+            pipeline=pipe,
+            x_train=x_train,
+            y_train=y_train,
+            groups_train=groups_train,
+            x_test=x_test,
+            y_test=y_test,
+            n_splits=5,
+        )
+
+    with pytest.raises(ValueError, match="Static folds must be provided"):
+        run_benchmark_suite(
+            x_train=x_train,
+            y_train=y_train,
+            groups_train=groups_train,
+            x_test=x_test,
+            y_test=y_test,
+            models={"LR": LogisticRegression(max_iter=1000, random_state=42)},
+            categorical_indices=cat_indices,
+            n_splits=5,
+        )
