@@ -19,10 +19,6 @@ if src_path not in sys.path:
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import pytest  # noqa: E402
-from imblearn.over_sampling import SMOTENC  # noqa: E402
-from sklearn.linear_model import LogisticRegression  # noqa: E402
-from sklearn.model_selection import GroupKFold  # noqa: E402
-
 from agilab_lib.modeling import (  # noqa: E402
     BenchmarkModelResult,
     calculate_metrics,
@@ -38,15 +34,18 @@ from agilab_lib.visualization import (  # noqa: E402
     plot_benchmark_roc_curves,
     plot_top_feature_importance,
 )
+from imblearn.over_sampling import SMOTENC  # noqa: E402
+from sklearn.linear_model import LogisticRegression  # noqa: E402
+from sklearn.model_selection import GroupKFold, StratifiedGroupKFold  # noqa: E402
 
 TRAIN_PARQUET_PATH = Path("data/processed/train_cleaned_rolling_3yr.parquet")
 TEST_PARQUET_PATH = Path("data/processed/test_uncurated_rolling_3yr.parquet")
 
 
 @pytest.fixture
-def synthetic_mixed_cohort() -> tuple[
-    pd.DataFrame, np.ndarray, np.ndarray, pd.DataFrame, np.ndarray, np.ndarray
-]:
+def synthetic_mixed_cohort() -> (
+    tuple[pd.DataFrame, np.ndarray, np.ndarray, pd.DataFrame, np.ndarray, np.ndarray]
+):
     """Generate reproducible synthetic mixed cohort with patient clusters.
 
     Returns:
@@ -100,6 +99,41 @@ def synthetic_mixed_cohort() -> tuple[
     return x_train, y_train, groups_train, x_test, y_test, groups_test
 
 
+@pytest.fixture
+def synthetic_partitioned_cohort(
+    synthetic_mixed_cohort: tuple[
+        pd.DataFrame,
+        np.ndarray,
+        np.ndarray,
+        pd.DataFrame,
+        np.ndarray,
+        np.ndarray,
+    ],
+) -> tuple[
+    pd.DataFrame,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    pd.DataFrame,
+    np.ndarray,
+    np.ndarray,
+]:
+    """Generate synthetic cohort with pre-computed static fold assignments.
+
+    Returns:
+        Tuple of (x_train, y_train, groups_train, folds_train,
+        x_test, y_test, groups_test).
+    """
+    x_train, y_train, groups_train, x_test, y_test, groups_test = synthetic_mixed_cohort
+    sgkf = StratifiedGroupKFold(n_splits=5, shuffle=True, random_state=42)
+    folds_train = np.zeros(len(y_train), dtype=int)
+    for fold_idx, (_, val_idx) in enumerate(
+        sgkf.split(x_train, y_train, groups=groups_train)
+    ):
+        folds_train[val_idx] = fold_idx
+    return x_train, y_train, groups_train, folds_train, x_test, y_test, groups_test
+
+
 def test_identify_categorical_features(
     synthetic_mixed_cohort: tuple[
         pd.DataFrame,
@@ -145,8 +179,9 @@ def test_find_optimal_threshold() -> None:
 
 
 def test_oof_threshold_independence_from_test_labels(
-    synthetic_mixed_cohort: tuple[
+    synthetic_partitioned_cohort: tuple[
         pd.DataFrame,
+        np.ndarray,
         np.ndarray,
         np.ndarray,
         pd.DataFrame,
@@ -155,7 +190,9 @@ def test_oof_threshold_independence_from_test_labels(
     ],
 ) -> None:
     """Assert OOF threshold selection is completely independent of test labels."""
-    x_train, y_train, groups_train, x_test, y_test, _ = synthetic_mixed_cohort
+    x_train, y_train, groups_train, folds_train, x_test, y_test, _ = (
+        synthetic_partitioned_cohort
+    )
     cat_indices = identify_categorical_features(x_train)
 
     pipe = create_smote_pipeline(
@@ -164,7 +201,7 @@ def test_oof_threshold_independence_from_test_labels(
         random_state=42,
     )
 
-    # Run with original test labels
+    # Run with original test labels and static folds
     res_orig = evaluate_model_cv_and_test(
         model_name="LR_Test",
         pipeline=pipe,
@@ -174,6 +211,7 @@ def test_oof_threshold_independence_from_test_labels(
         x_test=x_test,
         y_test=y_test,
         n_splits=5,
+        folds_train=folds_train,
     )
 
     # Invert all test labels entirely
@@ -187,6 +225,7 @@ def test_oof_threshold_independence_from_test_labels(
         x_test=x_test,
         y_test=y_test_inverted,
         n_splits=5,
+        folds_train=folds_train,
     )
 
     # Optimal threshold T* MUST be strictly identical regardless of test labels!
@@ -219,8 +258,9 @@ def test_group_kfold_patient_isolation(
 
 
 def test_infold_smote_nc_isolation(
-    synthetic_mixed_cohort: tuple[
+    synthetic_partitioned_cohort: tuple[
         pd.DataFrame,
+        np.ndarray,
         np.ndarray,
         np.ndarray,
         pd.DataFrame,
@@ -229,7 +269,9 @@ def test_infold_smote_nc_isolation(
     ],
 ) -> None:
     """Assert in-fold SMOTE-NC never alters validation folds or test set."""
-    x_train, y_train, groups_train, x_test, y_test, _ = synthetic_mixed_cohort
+    x_train, y_train, groups_train, folds_train, x_test, y_test, _ = (
+        synthetic_partitioned_cohort
+    )
     cat_indices = identify_categorical_features(x_train)
 
     initial_test_len = len(x_test)
@@ -250,6 +292,7 @@ def test_infold_smote_nc_isolation(
         x_test=x_test,
         y_test=y_test,
         n_splits=5,
+        folds_train=folds_train,
     )
 
     # Test set must remain strictly untouched
@@ -262,8 +305,136 @@ def test_infold_smote_nc_isolation(
     x_res, _ = sm.fit_resample(x_train, y_train)
     for col in ["bin_chf", "bin_cad", "bin_dm"]:
         unique_vals = set(x_res[col].unique())
-        assert unique_vals.issubset({0.0, 1.0, 0, 1}), (
-            f"Non-binary comorbidity generated: {unique_vals}"
+        assert unique_vals.issubset(
+            {0.0, 1.0, 0, 1}
+        ), f"Non-binary comorbidity generated: {unique_vals}"
+
+
+def test_static_fold_consumption(
+    synthetic_partitioned_cohort: tuple[
+        pd.DataFrame,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        pd.DataFrame,
+        np.ndarray,
+        np.ndarray,
+    ],
+) -> None:
+    """Verify evaluate_model_cv_and_test directly consumes static fold assignments."""
+    x_train, y_train, groups_train, folds_train, x_test, y_test, _ = (
+        synthetic_partitioned_cohort
+    )
+    cat_indices = identify_categorical_features(x_train)
+    pipe = create_smote_pipeline(
+        classifier=LogisticRegression(max_iter=1000, random_state=42),
+        categorical_indices=cat_indices,
+        random_state=42,
+    )
+
+    res = evaluate_model_cv_and_test(
+        model_name="Static_Fold_Test",
+        pipeline=pipe,
+        x_train=x_train,
+        y_train=y_train,
+        groups_train=groups_train,
+        x_test=x_test,
+        y_test=y_test,
+        n_splits=5,
+        folds_train=folds_train,
+    )
+
+    assert len(res["oof_probs"]) == len(y_train)
+    assert not np.isnan(res["oof_probs"]).any()
+    assert 0.05 <= res["optimal_threshold"] <= 0.95
+    assert not np.isnan(res["test_probs"]).any()
+
+
+def test_feature_quarantine_fold_and_metadata_columns(
+    synthetic_partitioned_cohort: tuple[
+        pd.DataFrame,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        pd.DataFrame,
+        np.ndarray,
+        np.ndarray,
+    ],
+) -> None:
+    """Verify fold and metadata columns in x_train are quarantined."""
+    x_train, y_train, groups_train, folds_train, x_test, y_test, _ = (
+        synthetic_partitioned_cohort
+    )
+    x_train_embedded = x_train.copy()
+    x_train_embedded["fold"] = folds_train
+    x_train_embedded["PatientID"] = groups_train
+    x_train_embedded["is_death_3yr"] = y_train
+
+    x_test_embedded = x_test.copy()
+    x_test_embedded["fold"] = 0
+    x_test_embedded["PatientID"] = 999
+    x_test_embedded["is_death_3yr"] = y_test
+
+    models = {"Logistic Regression": LogisticRegression(max_iter=1000, random_state=42)}
+
+    results = run_benchmark_suite(
+        x_train=x_train_embedded,
+        y_train=y_train,
+        x_test=x_test_embedded,
+        y_test=y_test,
+        models=models,
+        n_splits=5,
+        random_state=42,
+    )
+
+    fitted_pipe = results["fitted_pipelines"]["Logistic Regression"]
+    clf = fitted_pipe.named_steps["classifier"]
+    expected_n_features = x_train.shape[1]
+    assert clf.n_features_in_ == expected_n_features
+    if hasattr(clf, "feature_names_in_"):
+        assert "fold" not in clf.feature_names_in_
+        assert "PatientID" not in clf.feature_names_in_
+        assert "is_death_3yr" not in clf.feature_names_in_
+
+
+def test_static_folds_patient_leakage_assertion(
+    synthetic_partitioned_cohort: tuple[
+        pd.DataFrame,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        pd.DataFrame,
+        np.ndarray,
+        np.ndarray,
+    ],
+) -> None:
+    """Verify runtime error is raised if static folds leak patient identities."""
+    x_train, y_train, groups_train, folds_train, x_test, y_test, _ = (
+        synthetic_partitioned_cohort
+    )
+    corrupted_folds = folds_train.copy()
+    patient_1_idx = np.where(groups_train == 1)[0]
+    corrupted_folds[patient_1_idx[: len(patient_1_idx) // 2]] = 0
+    corrupted_folds[patient_1_idx[len(patient_1_idx) // 2 :]] = 1
+
+    cat_indices = identify_categorical_features(x_train)
+    pipe = create_smote_pipeline(
+        classifier=LogisticRegression(max_iter=1000, random_state=42),
+        categorical_indices=cat_indices,
+        random_state=42,
+    )
+
+    with pytest.raises(RuntimeError, match="Subject leakage detected"):
+        evaluate_model_cv_and_test(
+            model_name="Leakage_Check",
+            pipeline=pipe,
+            x_train=x_train,
+            y_train=y_train,
+            groups_train=groups_train,
+            x_test=x_test,
+            y_test=y_test,
+            n_splits=5,
+            folds_train=corrupted_folds,
         )
 
 
@@ -288,8 +459,9 @@ def test_calculate_metrics_correctness() -> None:
 
 
 def test_all_11_models_synthetic_battery(
-    synthetic_mixed_cohort: tuple[
+    synthetic_partitioned_cohort: tuple[
         pd.DataFrame,
+        np.ndarray,
         np.ndarray,
         np.ndarray,
         pd.DataFrame,
@@ -297,8 +469,10 @@ def test_all_11_models_synthetic_battery(
         np.ndarray,
     ],
 ) -> None:
-    """Verify all 11 models train, predict valid probabilities, and compute metrics."""
-    x_train, y_train, groups_train, x_test, y_test, _ = synthetic_mixed_cohort
+    """Verify Invariant 7: all 11 models train on static folds."""
+    x_train, y_train, groups_train, folds_train, x_test, y_test, _ = (
+        synthetic_partitioned_cohort
+    )
     cat_indices = identify_categorical_features(x_train)
 
     models = get_model_zoo(random_state=42)
@@ -321,6 +495,7 @@ def test_all_11_models_synthetic_battery(
             x_test=x_test,
             y_test=y_test,
             n_splits=5,
+            folds_train=folds_train,
         )
 
         test_probs = res["test_probs"]
@@ -329,12 +504,18 @@ def test_all_11_models_synthetic_battery(
         # Assert probabilities are valid and bounded in [0, 1]
         assert not np.isnan(test_probs).any(), f"NaNs in test probs for {name}"
         assert not np.isnan(oof_probs).any(), f"NaNs in OOF probs for {name}"
-        assert np.all((test_probs >= 0.0) & (test_probs <= 1.0)), (
-            f"Out of bounds prob for {name}"
-        )
-        assert np.all((oof_probs >= 0.0) & (oof_probs <= 1.0)), (
-            f"Out of bounds OOF prob for {name}"
-        )
+        assert np.all(
+            (test_probs >= 0.0) & (test_probs <= 1.0)
+        ), f"Out of bounds prob for {name}"
+        assert np.all(
+            (oof_probs >= 0.0) & (oof_probs <= 1.0)
+        ), f"Out of bounds OOF prob for {name}"
+
+        # Assert threshold calibration
+        assert (
+            0.05 <= res["optimal_threshold"] <= 0.95
+        ), f"Threshold out of bounds for {name}"
+        assert not np.isnan(res["oof_f1"])
 
         # Assert decisions are binary
         assert set(res["test_pred_default"]).issubset({0, 1})
@@ -493,10 +674,11 @@ def test_group_kfold_validation_empirical_class_balance(
 
 
 def test_identify_categorical_features_drops_target_and_id() -> None:
-    """Verify target and PatientID columns are dropped to prevent index drift."""
+    """Verify target, PatientID, and fold columns are dropped to prevent index drift."""
     df = pd.DataFrame(
         {
             "PatientID": [101, 102, 103, 104],
+            "fold": [0, 1, 2, 3],
             "is_death_3yr": [0, 1, 0, 1],
             "cont_feature": [1.2, 3.4, 5.6, 7.8],
             "bin_comorb": [0.0, 1.0, 0.0, 1.0],
@@ -505,13 +687,13 @@ def test_identify_categorical_features_drops_target_and_id() -> None:
     )
 
     cat_indices = identify_categorical_features(df)
-    # Feature matrix after dropping PatientID and is_death_3yr has columns:
+    # Feature matrix after dropping PatientID, fold, and is_death_3yr has columns:
     # 0: cont_feature, 1: bin_comorb, 2: HD_WS
     # Categorical indices must be [1, 2], NOT [3, 4]
     assert cat_indices == [1, 2]
 
     # Verify matching feature dataframe
-    feature_df = df.drop(columns=["PatientID", "is_death_3yr"])
+    feature_df = df.drop(columns=["PatientID", "fold", "is_death_3yr"])
     cat_cols = [feature_df.columns[i] for i in cat_indices]
     assert cat_cols == ["bin_comorb", "HD_WS"]
 
