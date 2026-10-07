@@ -29,6 +29,10 @@ from agilab_lib.modeling import (
 from agilab_lib.preprocessing import (
     ASSESSMENT_COLUMNS,
     CATEGORICAL_COLUMNS,
+    CV_AUDIT_COLUMNS,
+    CV_FOLD_COLUMN,
+    CV_N_SPLITS,
+    CV_RANDOM_STATE,
     DEFAULT_CONTINUOUS_COLUMNS,
     DISCRETE_COUNT_COLUMNS,
     HIGH_MISSING_DROPS,
@@ -45,6 +49,7 @@ from agilab_lib.preprocessing import (
     engineer_features,
     load_baseline_data,
     load_longitudinal_cohort,
+    partition_stratified_group_5fold,
     process_continuous_features,
     quarantine_target_leakage,
     split_patient_cohort,
@@ -105,4 +110,9 @@ __all__ = [
     "ZERO_FILL_INDICATOR_COLUMNS",
     "CATEGORICAL_COLUMNS",
     "DEFAULT_DISCRETE_COLUMNS",
+    "partition_stratified_group_5fold",
+    "CV_N_SPLITS",
+    "CV_RANDOM_STATE",
+    "CV_FOLD_COLUMN",
+    "CV_AUDIT_COLUMNS",
 ]

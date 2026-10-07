@@ -27,9 +27,12 @@ from agilab_lib.analysis import (  # noqa: E402
     fit_pca,
     prune_multivariate_outliers,
 )
+from agilab_lib.modeling import QUARANTINE_COLUMNS  # noqa: E402
 from agilab_lib.preprocessing import (  # noqa: E402
     ASSESSMENT_COLUMNS,
     CATEGORICAL_COLUMNS,
+    CV_AUDIT_COLUMNS,
+    CV_FOLD_COLUMN,
     DEFAULT_CONTINUOUS_COLUMNS,
     DISCRETE_COUNT_COLUMNS,
     HIGH_MISSING_DROPS,
@@ -42,6 +45,7 @@ from agilab_lib.preprocessing import (  # noqa: E402
     encode_categorical_features,
     engineer_features,
     load_longitudinal_cohort,
+    partition_stratified_group_5fold,
     process_continuous_features,
     quarantine_target_leakage,
     split_patient_cohort,
@@ -50,9 +54,20 @@ from agilab_lib.visualization import (  # noqa: E402
     plot_t2_vs_spe,
 )
 
-DATA_PATH = Path("data/Kidit_Master_Baseline_V2.xlsx")
-if not DATA_PATH.exists() and Path("E:/github/Kidit_Master_Baseline_V2.xlsx").exists():
-    DATA_PATH = Path("E:/github/Kidit_Master_Baseline_V2.xlsx")
+DATA_PATH_CANDIDATES = [
+    Path("data/Kidit_Master_Baseline_V2.xlsx"),
+    Path(__file__).resolve().parent.parent.parent.parent
+    / "AGILAB_MedicalAI"
+    / "data"
+    / "Kidit_Master_Baseline_V2.xlsx",
+    Path("E:/github/MedicalAI/AGILAB_MedicalAI/data/Kidit_Master_Baseline_V2.xlsx"),
+    Path("E:/github/Kidit_Master_Baseline_V2.xlsx"),
+    Path("E:/github/MedicalAI/data/Kidit_Master_Baseline_V2.xlsx"),
+]
+DATA_PATH = next(
+    (p for p in DATA_PATH_CANDIDATES if p.exists()),
+    Path("data/Kidit_Master_Baseline_V2.xlsx"),
+)
 
 
 @pytest.fixture
@@ -562,3 +577,268 @@ def test_visualization_t2_vs_spe() -> None:
     spe = np.random.uniform(0, 80, 100)
     fig = plot_t2_vs_spe(t2, spe, t2_limit=15.124, spe_limit=55.0)
     assert fig is not None
+
+
+def test_partition_stratified_group_5fold_synthetic() -> None:
+    """Test 5-fold stratified group cross-validation partitioning on synthetic cohort.
+
+    Verifies:
+        - Output df contains 'fold' column of type int8 in range [0, 4].
+        - Audit DataFrame has columns [record_id, PatientID, year, is_death_3yr, fold].
+        - record_id composite format matches f"{PatientID}_{year}".
+        - Invariant 3: Zero patient leakage across folds (disjoint PatientIDs).
+        - Invariant 4: Complete coverage (each row in fold 0..4).
+    """
+    np.random.seed(42)
+    # 20 patients, each with 2 to 5 records across years 2010-2015
+    records = []
+    for pid in range(101, 121):
+        n_years = int(np.random.randint(2, 6))
+        label = 1 if pid % 4 == 0 else 0
+        for yr_offset in range(n_years):
+            records.append(
+                {
+                    "PatientID": pid,
+                    "year": 2010 + yr_offset,
+                    "feat_1": float(np.random.randn()),
+                    "feat_2": float(np.random.randn()),
+                    "is_death_3yr": label,
+                }
+            )
+    df_synth = pd.DataFrame(records)
+
+    partitioned_df, audit_df = partition_stratified_group_5fold(df_synth)
+
+    assert len(partitioned_df) == len(df_synth)
+    assert len(audit_df) == len(df_synth)
+    assert CV_FOLD_COLUMN in partitioned_df.columns
+    assert partitioned_df[CV_FOLD_COLUMN].dtype == np.int8
+
+    assert list(audit_df.columns) == CV_AUDIT_COLUMNS
+    assert (partitioned_df[CV_FOLD_COLUMN].values == audit_df["fold"].values).all()
+    assert set(audit_df["fold"].unique()) == {0, 1, 2, 3, 4}
+
+    # Verify record_id format
+    for _idx, row in audit_df.iterrows():
+        expected_rid = f"{row['PatientID']}_{int(row['year'])}"
+        assert row["record_id"] == expected_rid
+
+    # Verify zero patient leakage across folds
+    for i in range(5):
+        pids_i = set(audit_df.loc[audit_df["fold"] == i, "PatientID"])
+        for j in range(i + 1, 5):
+            pids_j = set(audit_df.loc[audit_df["fold"] == j, "PatientID"])
+            assert len(pids_i.intersection(pids_j)) == 0
+
+
+def test_partition_stratified_group_5fold_missing_year() -> None:
+    """Test integer fallback for record_id when observation year is missing."""
+    df_no_year = pd.DataFrame(
+        {
+            "PatientID": [201, 201, 202, 202, 203, 203, 204, 204, 205, 205],
+            "val": np.random.randn(10),
+            "is_death_3yr": [0, 1, 0, 1, 0, 1, 0, 1, 0, 1],
+        }
+    )
+
+    partitioned_df, audit_df = partition_stratified_group_5fold(
+        df_no_year, year_col="year"
+    )
+
+    assert len(audit_df) == 10
+    # Missing year should fall back to f"{pid}_{idx}"
+    for i in range(len(audit_df)):
+        pid = audit_df.loc[i, "PatientID"]
+        assert audit_df.loc[i, "record_id"] == f"{pid}_{i}"
+    assert audit_df["year"].isna().all()
+
+
+PROCESSED_DATA_DIR = Path("data/processed")
+if not (PROCESSED_DATA_DIR / "train_cleaned_rolling_3yr.parquet").exists():
+    for candidate_dir in [
+        Path(__file__).resolve().parent.parent / "data" / "processed",
+        Path(__file__).resolve().parent.parent.parent.parent
+        / "AGILAB_MedicalAI"
+        / "data"
+        / "processed",
+        Path("E:/github/MedicalAI/AGILAB_MedicalAI/data/processed"),
+    ]:
+        if (candidate_dir / "train_cleaned_rolling_3yr.parquet").exists():
+            PROCESSED_DATA_DIR = candidate_dir
+            break
+
+
+def test_invariant_1_sample_count_and_audit_correspondence() -> None:
+    """Test Invariant 1: Purified train set has 3,737 rows matching audit CSV."""
+    train_pq_path = PROCESSED_DATA_DIR / "train_cleaned_rolling_3yr.parquet"
+    audit_csv_path = PROCESSED_DATA_DIR / "train_cv_folds.csv"
+
+    if not train_pq_path.exists() or not audit_csv_path.exists():
+        pytest.skip("Processed artifacts not available")
+
+    df_train = pd.read_parquet(train_pq_path)
+    df_audit = pd.read_csv(audit_csv_path)
+
+    # Invariant 1: exactly 3,737 purified records
+    assert len(df_train) == 3737
+    assert len(df_audit) == 3737
+    assert df_audit["record_id"].nunique() == 3737
+
+    # Audit columns schema
+    assert list(df_audit.columns) == CV_AUDIT_COLUMNS
+
+    # Exact correspondence between audit CSV fold and parquet fold
+    assert (df_audit["fold"].values == df_train["fold"].values).all()
+    assert (df_audit["is_death_3yr"].values == df_train["is_death_3yr"].values).all()
+
+    # Formatted record_id verification
+    for _, row in df_audit.head(50).iterrows():
+        assert row["record_id"] == f"{row['PatientID']}_{int(row['year'])}"
+
+
+def test_invariant_2_non_mode_imputation() -> None:
+    """Test Invariant 2: Non-mode imputation architecture across train and test.
+
+    Verifies:
+        - genAssess and actAssess imputed via KNN distance weights (not mode).
+        - HD_WS, HD_ST, CIC, total_hd_time, txIntervalMin OHE with dummy_na.
+        - ID_U and MD_U filled with 0.0 baseline and accompanied by _isna flags.
+        - Zero missing values in full feature matrix.
+    """
+    train_pq_path = PROCESSED_DATA_DIR / "train_cleaned_rolling_3yr.parquet"
+    test_pq_path = PROCESSED_DATA_DIR / "test_uncurated_rolling_3yr.parquet"
+
+    if not train_pq_path.exists() or not test_pq_path.exists():
+        pytest.skip("Processed parquet datasets not available")
+
+    df_train = pd.read_parquet(train_pq_path)
+    df_test = pd.read_parquet(test_pq_path)
+
+    # 1. Zero NaNs across all columns
+    assert df_train.isna().sum().sum() == 0
+    assert df_test.isna().sum().sum() == 0
+
+    # 2. Assessment columns are present and non-null
+    for assess_col in ASSESSMENT_COLUMNS:
+        assert assess_col in df_train.columns
+        assert assess_col in df_test.columns
+
+    # 3. Categorical missingness preserved via dummy_na columns
+    for col_prefix in [
+        "HD_WS_nan",
+        "HD_ST_nan",
+        "CIC_nan",
+        "total_hd_time_nan",
+        "txIntervalMin_nan",
+    ]:
+        assert any(c.startswith(col_prefix) for c in df_train.columns)
+        assert any(c.startswith(col_prefix) for c in df_test.columns)
+
+    # 4. Zero-fill features and explicit _isna binary indicators
+    for col in ZERO_FILL_INDICATOR_COLUMNS:
+        assert col in df_train.columns and f"{col}_isna" in df_train.columns
+        assert col in df_test.columns and f"{col}_isna" in df_test.columns
+        assert set(df_train[f"{col}_isna"].unique()).issubset({0.0, 1.0})
+        assert set(df_test[f"{col}_isna"].unique()).issubset({0.0, 1.0})
+
+
+def test_invariant_3_zero_patient_leakage_across_folds() -> None:
+    """Test Invariant 3: Zero patient leakage across folds (PatientID disjoint)."""
+    audit_csv_path = PROCESSED_DATA_DIR / "train_cv_folds.csv"
+    if not audit_csv_path.exists():
+        pytest.skip("train_cv_folds.csv not available")
+
+    df_audit = pd.read_csv(audit_csv_path)
+
+    # Verify pairwise patient disjointness
+    for i in range(5):
+        pids_i = set(df_audit.loc[df_audit["fold"] == i, "PatientID"])
+        for j in range(i + 1, 5):
+            pids_j = set(df_audit.loc[df_audit["fold"] == j, "PatientID"])
+            overlap = pids_i.intersection(pids_j)
+            assert (
+                len(overlap) == 0
+            ), f"Patient leakage between fold {i} and {j}: {overlap}"
+
+    # Verify total unique patients equals sum across folds
+    total_unique_pids = df_audit["PatientID"].nunique()
+    sum_fold_pids = sum(
+        df_audit.loc[df_audit["fold"] == f, "PatientID"].nunique() for f in range(5)
+    )
+    assert total_unique_pids == sum_fold_pids
+
+
+def test_invariant_4_complete_coverage_and_valid_folds() -> None:
+    """Test Invariant 4: Every row assigned exactly one valid fold in {0,1,2,3,4}."""
+    train_pq_path = PROCESSED_DATA_DIR / "train_cleaned_rolling_3yr.parquet"
+    if not train_pq_path.exists():
+        pytest.skip("train_cleaned_rolling_3yr.parquet not available")
+
+    df_train = pd.read_parquet(train_pq_path)
+
+    # 1. Fold column exists and has dtype int8
+    assert "fold" in df_train.columns
+    assert df_train["fold"].dtype == np.int8
+
+    # 2. All 5 folds exist and no unassigned rows
+    assert set(df_train["fold"].unique()) == {0, 1, 2, 3, 4}
+    assert df_train["fold"].isna().sum() == 0
+
+    # 3. Stratification balance: every fold contains both death and survival records
+    for f in range(5):
+        fold_mask = df_train["fold"] == f
+        y_fold = df_train.loc[fold_mask, "is_death_3yr"]
+        assert (y_fold == 1).sum() > 0, f"Fold {f} has no death events!"
+        assert (y_fold == 0).sum() > 0, f"Fold {f} has no survivor records!"
+        death_rate = float(y_fold.mean())
+        assert (
+            0.10 <= death_rate <= 0.30
+        ), f"Fold {f} death rate {death_rate:.2%} is severely imbalanced!"
+
+
+def test_invariant_5_feature_separation_quarantine() -> None:
+    """Test Invariant 5: fold column quarantined from feature matrix X."""
+    train_pq_path = PROCESSED_DATA_DIR / "train_cleaned_rolling_3yr.parquet"
+    if not train_pq_path.exists():
+        pytest.skip("train_cleaned_rolling_3yr.parquet not available")
+
+    df_train = pd.read_parquet(train_pq_path)
+
+    # 1. QUARANTINE_COLUMNS must explicitly include 'fold'
+    assert "fold" in QUARANTINE_COLUMNS
+    assert "is_death_3yr" in QUARANTINE_COLUMNS
+    assert "PatientID" in QUARANTINE_COLUMNS
+
+    # 2. When quarantined columns are stripped, X has 0 metadata / target columns
+    drop_cols = [c for c in QUARANTINE_COLUMNS if c in df_train.columns]
+    x_features = df_train.drop(columns=drop_cols)
+
+    assert "fold" not in x_features.columns
+    assert "is_death_3yr" not in x_features.columns
+    assert "is_death" not in x_features.columns
+    assert "PatientID" not in x_features.columns
+
+    # All columns in x_features must be numeric
+    for col in x_features.columns:
+        assert np.issubdtype(
+            x_features[col].dtype, np.number
+        ), f"Column {col} is non-numeric!"
+
+
+def test_invariant_6_test_set_isolation() -> None:
+    """Test Invariant 6: Uncurated test set has 1,112 rows and no fold column."""
+    test_pq_path = PROCESSED_DATA_DIR / "test_uncurated_rolling_3yr.parquet"
+    if not test_pq_path.exists():
+        pytest.skip("test_uncurated_rolling_3yr.parquet not available")
+
+    df_test = pd.read_parquet(test_pq_path)
+
+    # 1. Exact sample count (1,112 rows, 0 deletions)
+    assert len(df_test) == 1112
+
+    # 2. Test set does NOT contain the fold column
+    assert "fold" not in df_test.columns
+
+    # 3. Target label is preserved
+    assert "is_death_3yr" in df_test.columns
+    assert set(df_test["is_death_3yr"].unique()).issubset({0, 1})

@@ -14,7 +14,7 @@ from typing import Sequence
 import numpy as np
 import pandas as pd
 from sklearn.impute import KNNImputer, SimpleImputer
-from sklearn.model_selection import GroupShuffleSplit
+from sklearn.model_selection import GroupShuffleSplit, StratifiedGroupKFold
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 
 logger = logging.getLogger(__name__)
@@ -48,6 +48,18 @@ IDENTIFIER_COLUMNS: list[str] = [
 # Primary prediction labels
 LABEL_COLUMN: str = "is_death"
 LABEL_COLUMN_3YR: str = "is_death_3yr"
+
+# Stratified group cross-validation partitioning constants
+CV_N_SPLITS: int = 5
+CV_RANDOM_STATE: int = 42
+CV_FOLD_COLUMN: str = "fold"
+CV_AUDIT_COLUMNS: list[str] = [
+    "record_id",
+    "PatientID",
+    "year",
+    "is_death_3yr",
+    "fold",
+]
 
 # Features with >20% missingness to be discarded per specification
 HIGH_MISSING_DROPS: list[str] = [
@@ -959,3 +971,147 @@ def build_feature_matrices(
         full_feature_matrix["is_death_1yr"] = is_death_1yr.values
 
     return scaled_cont_df, full_feature_matrix, target
+
+
+def partition_stratified_group_5fold(
+    df: pd.DataFrame,
+    patient_id_col: str = "PatientID",
+    target_col: str = "is_death_3yr",
+    year_col: str = "year",
+    n_splits: int = CV_N_SPLITS,
+    random_state: int = CV_RANDOM_STATE,
+    patient_ids: Sequence | pd.Series | np.ndarray | None = None,
+    years: Sequence | pd.Series | np.ndarray | None = None,
+    targets: Sequence | pd.Series | np.ndarray | None = None,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Partition dataset into immutable stratified group k-folds.
+
+    Uses StratifiedGroupKFold to partition records strictly grouped by patient
+    identity while stratifying across binary target mortality outcomes.
+    Generates a deterministic fold assignment (fold: int8 in 0..n_splits-1)
+    and an audit DataFrame containing composite identifiers (record_id =
+    f"{PatientID}_{year}" with an integer index fallback if year is missing).
+
+    Args:
+        df: Input feature matrix or DataFrame to be partitioned.
+        patient_id_col: Column name representing patient group identifiers.
+        target_col: Column name representing binary outcome label.
+        year_col: Column name representing observation year.
+        n_splits: Number of cross-validation folds (default 5).
+        random_state: Random state seed for reproducibility (default 42).
+        patient_ids: Optional explicit sequence of patient IDs. If None,
+            extracted from df[patient_id_col].
+        years: Optional explicit sequence of observation years. If None,
+            extracted from df[year_col] or df['報告年度'].
+        targets: Optional explicit sequence of target labels. If None,
+            extracted from df[target_col] or df['is_death'].
+
+    Returns:
+        A tuple of (partitioned_df, audit_df):
+            - partitioned_df: A copy of df with an added 'fold' column (int8).
+            - audit_df: Standalone audit DataFrame with columns
+              ['record_id', 'PatientID', 'year', 'is_death_3yr', 'fold'].
+
+    Raises:
+        ValueError: If patient IDs or targets cannot be resolved from inputs.
+        RuntimeError: If fold assignment fails to cover all rows.
+    """
+    if len(df) == 0:
+        empty_audit = pd.DataFrame(columns=CV_AUDIT_COLUMNS)
+        df_empty = df.copy()
+        df_empty[CV_FOLD_COLUMN] = pd.Series(dtype="int8")
+        return df_empty, empty_audit
+
+    # 1. Resolve patient IDs
+    if patient_ids is not None:
+        pids = pd.Series(patient_ids, index=df.index)
+    elif patient_id_col in df.columns:
+        pids = df[patient_id_col]
+    else:
+        raise ValueError(
+            f"Patient ID column '{patient_id_col}' not found in DataFrame and "
+            "no patient_ids argument was provided."
+        )
+
+    # 2. Resolve targets
+    if targets is not None:
+        y = pd.Series(targets, index=df.index)
+    elif target_col in df.columns:
+        y = df[target_col]
+    elif LABEL_COLUMN in df.columns:
+        y = df[LABEL_COLUMN]
+    else:
+        raise ValueError(
+            f"Target column '{target_col}' not found in DataFrame and "
+            "no targets argument was provided."
+        )
+
+    # 3. Resolve observation years
+    if years is not None:
+        yr = pd.Series(years, index=df.index)
+    elif year_col in df.columns:
+        yr = df[year_col]
+    elif "報告年度" in df.columns:
+        yr = df["報告年度"]
+    else:
+        yr = pd.Series(np.nan, index=df.index)
+
+    # 4. Perform StratifiedGroupKFold partitioning
+    sgkf = StratifiedGroupKFold(
+        n_splits=n_splits, shuffle=True, random_state=random_state
+    )
+    fold_assignments = np.full(len(df), -1, dtype=np.int8)
+
+    y_arr = y.to_numpy()
+    pids_arr = pids.to_numpy()
+
+    for fold_idx, (_train_idx, val_idx) in enumerate(
+        sgkf.split(df, y_arr, groups=pids_arr)
+    ):
+        fold_assignments[val_idx] = np.int8(fold_idx)
+
+    if (fold_assignments < 0).any():
+        unassigned_count = int((fold_assignments < 0).sum())
+        raise RuntimeError(
+            f"StratifiedGroupKFold failed to assign {unassigned_count} "
+            "records to a fold."
+        )
+
+    # 5. Generate composite identifier record_id = f"{PatientID}_{year}"
+    record_ids: list[str] = []
+    for i, (_, row_pid, row_yr) in enumerate(zip(df.index, pids, yr)):
+        pid_str = str(row_pid)
+        if pd.notna(row_yr):
+            try:
+                yr_val = int(float(str(row_yr)))
+                record_ids.append(f"{pid_str}_{yr_val}")
+            except (ValueError, TypeError):
+                yr_clean = str(row_yr).strip()
+                if yr_clean:
+                    record_ids.append(f"{pid_str}_{yr_clean}")
+                else:
+                    record_ids.append(f"{pid_str}_{i}")
+        else:
+            record_ids.append(f"{pid_str}_{i}")
+
+    # 6. Format year for audit DataFrame
+    if pd.api.types.is_numeric_dtype(yr):
+        audit_year = yr.astype("Int64")
+    else:
+        audit_year = yr
+
+    audit_df = pd.DataFrame(
+        {
+            "record_id": record_ids,
+            "PatientID": pids.values,
+            "year": audit_year.values,
+            "is_death_3yr": y.to_numpy(dtype=int),
+            "fold": fold_assignments,
+        },
+        index=df.index,
+    )
+
+    df_out = df.copy()
+    df_out[CV_FOLD_COLUMN] = pd.Series(fold_assignments, index=df.index, dtype="int8")
+
+    return df_out, audit_df

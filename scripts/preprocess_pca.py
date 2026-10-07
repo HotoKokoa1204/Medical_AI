@@ -34,6 +34,7 @@ from agilab_lib.preprocessing import (  # noqa: E402
     deterministic_pruning,
     engineer_features,
     load_longitudinal_cohort,
+    partition_stratified_group_5fold,
     split_patient_cohort,
 )
 from agilab_lib.visualization import (  # noqa: E402
@@ -105,6 +106,13 @@ def main() -> int:
     else:
         candidates = [
             project_root / "data" / "Kidit_Master_Baseline_V2.xlsx",
+            project_root.parent.parent
+            / "AGILAB_MedicalAI"
+            / "data"
+            / "Kidit_Master_Baseline_V2.xlsx",
+            Path(
+                "E:/github/MedicalAI/AGILAB_MedicalAI/data/Kidit_Master_Baseline_V2.xlsx"
+            ),
             Path("E:/github/Kidit_Master_Baseline_V2.xlsx"),
             Path("E:/github/MedicalAI/data/Kidit_Master_Baseline_V2.xlsx"),
         ]
@@ -298,12 +306,46 @@ def main() -> int:
         f"Purified Train Set: {len(full_train_clean)} records."
     )
 
+    # 5b. Immutable Stratified Group 5-Fold Partitioning
+    print(
+        "\n[Step 5b] Partitioning purified train set into immutable 5 folds "
+        "(grouped by PatientID, stratified by is_death_3yr)..."
+    )
+    train_det_clean = train_det.loc[full_train_clean.index]
+    year_series = (
+        train_det_clean["報告年度"]
+        if "報告年度" in train_det_clean.columns
+        else train_det_clean.get("year")
+    )
+    full_train_clean, audit_df = partition_stratified_group_5fold(
+        df=full_train_clean,
+        patient_ids=train_det_clean["PatientID"],
+        years=year_series,
+        targets=full_train_clean["is_death_3yr"],
+    )
+    fold_dist = dict(full_train_clean["fold"].value_counts().sort_index())
+    print(
+        f"  [OK] Assigned immutable 5-fold partition to {len(full_train_clean)} "
+        f"records. Folds: {fold_dist}"
+    )
+
     # 6. Save Cleaned Parquet Datasets & Audit Trail (Export once to output_dir)
     print("\n[Step 6/6] Saving Parquet feature matrices and publication figures...")
     train_parquet_path = output_dir / "train_cleaned_rolling_3yr.parquet"
     test_parquet_path = output_dir / "test_uncurated_rolling_3yr.parquet"
     cont_parquet_path = output_dir / "continuous_features_pca.parquet"
+    folds_csv_path = output_dir / "train_cv_folds.csv"
     audit_trail_path = output_dir / "preprocessing_audit_trail.json"
+
+    # Export standalone audit CSV with columns:
+    # [record_id, PatientID, year, is_death_3yr, fold]
+    audit_df.to_csv(folds_csv_path, index=False)
+    print(f"  [OK] Saved Train CV Folds Audit Table: {folds_csv_path}")
+
+    # Verify fold isolation invariants
+    assert "fold" not in full_test_df.columns, "Test set must not contain fold column!"
+    assert "fold" in full_train_clean.columns, "Train set must contain fold column!"
+    assert full_train_clean["fold"].dtype == np.int8, "Fold column must be int8!"
 
     full_train_clean.to_parquet(train_parquet_path, engine="pyarrow", index=True)
     full_test_df.to_parquet(test_parquet_path, engine="pyarrow", index=True)
@@ -332,13 +374,22 @@ def main() -> int:
             ),
             "test_mortality_rate": float(full_test_df["is_death_3yr"].mean()),
         },
+        "stratified_group_5fold": {
+            "n_records": len(audit_df),
+            "n_folds": 5,
+            "fold_counts": {
+                int(k): int(v)
+                for k, v in full_train_clean["fold"].value_counts().items()
+            },
+            "csv_path": str(folds_csv_path.name),
+        },
     }
 
     with open(audit_trail_path, "w", encoding="utf-8") as f:
         json.dump(audit_trail, f, indent=2)
 
-    print(f"  [OK] Saved Cleaned Train Parquet: {train_parquet_path}")
-    print(f"  [OK] Saved Uncurated Test Parquet: {test_parquet_path}")
+    print(f"  [OK] Saved Cleaned Train Parquet (with fold): {train_parquet_path}")
+    print(f"  [OK] Saved Uncurated Test Parquet (no fold): {test_parquet_path}")
     print(f"  [OK] Saved Continuous PCA Matrix: {cont_parquet_path}")
     print(f"  [OK] Saved Preprocessing Audit Trail: {audit_trail_path}")
 
