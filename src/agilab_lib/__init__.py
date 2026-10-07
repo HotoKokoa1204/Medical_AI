@@ -27,6 +27,8 @@ from agilab_lib.modeling import (
     run_benchmark_suite,
 )
 from agilab_lib.preprocessing import (
+    ASSESSMENT_COLUMNS,
+    CATEGORICAL_COLUMNS,
     DEFAULT_CONTINUOUS_COLUMNS,
     DISCRETE_COUNT_COLUMNS,
     HIGH_MISSING_DROPS,
@@ -34,6 +36,7 @@ from agilab_lib.preprocessing import (
     LABEL_COLUMN,
     LABEL_COLUMN_3YR,
     TARGET_LEAKAGE_COLUMNS,
+    ZERO_FILL_INDICATOR_COLUMNS,
     LongitudinalPreprocessor,
     build_feature_matrices,
     clean_clinical_bounds,
@@ -98,5 +101,8 @@ __all__ = [
     "HIGH_MISSING_DROPS",
     "DEFAULT_CONTINUOUS_COLUMNS",
     "DISCRETE_COUNT_COLUMNS",
+    "ASSESSMENT_COLUMNS",
+    "ZERO_FILL_INDICATOR_COLUMNS",
+    "CATEGORICAL_COLUMNS",
     "DEFAULT_DISCRETE_COLUMNS",
 ]
