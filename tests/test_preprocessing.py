@@ -19,6 +19,7 @@ if src_path not in sys.path:
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import pytest  # noqa: E402
+
 from agilab_lib.analysis import (  # noqa: E402
     calculate_hotelling_t2,
     calculate_spe,
@@ -755,9 +756,9 @@ def test_invariant_3_zero_patient_leakage_across_folds() -> None:
         for j in range(i + 1, 5):
             pids_j = set(df_audit.loc[df_audit["fold"] == j, "PatientID"])
             overlap = pids_i.intersection(pids_j)
-            assert (
-                len(overlap) == 0
-            ), f"Patient leakage between fold {i} and {j}: {overlap}"
+            assert len(overlap) == 0, (
+                f"Patient leakage between fold {i} and {j}: {overlap}"
+            )
 
     # Verify total unique patients equals sum across folds
     total_unique_pids = df_audit["PatientID"].nunique()
@@ -790,9 +791,9 @@ def test_invariant_4_complete_coverage_and_valid_folds() -> None:
         assert (y_fold == 1).sum() > 0, f"Fold {f} has no death events!"
         assert (y_fold == 0).sum() > 0, f"Fold {f} has no survivor records!"
         death_rate = float(y_fold.mean())
-        assert (
-            0.10 <= death_rate <= 0.30
-        ), f"Fold {f} death rate {death_rate:.2%} is severely imbalanced!"
+        assert 0.10 <= death_rate <= 0.30, (
+            f"Fold {f} death rate {death_rate:.2%} is severely imbalanced!"
+        )
 
 
 def test_invariant_5_feature_separation_quarantine() -> None:
@@ -819,9 +820,9 @@ def test_invariant_5_feature_separation_quarantine() -> None:
 
     # All columns in x_features must be numeric
     for col in x_features.columns:
-        assert np.issubdtype(
-            x_features[col].dtype, np.number
-        ), f"Column {col} is non-numeric!"
+        assert np.issubdtype(x_features[col].dtype, np.number), (
+            f"Column {col} is non-numeric!"
+        )
 
 
 def test_invariant_6_test_set_isolation() -> None:
