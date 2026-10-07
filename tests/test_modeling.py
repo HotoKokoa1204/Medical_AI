@@ -19,10 +19,6 @@ if src_path not in sys.path:
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import pytest  # noqa: E402
-from imblearn.over_sampling import SMOTENC  # noqa: E402
-from sklearn.linear_model import LogisticRegression  # noqa: E402
-from sklearn.model_selection import GroupKFold, StratifiedGroupKFold  # noqa: E402
-
 from agilab_lib.modeling import (  # noqa: E402
     QUARANTINE_COLUMNS,
     BenchmarkModelResult,
@@ -39,15 +35,18 @@ from agilab_lib.visualization import (  # noqa: E402
     plot_benchmark_roc_curves,
     plot_top_feature_importance,
 )
+from imblearn.over_sampling import SMOTENC  # noqa: E402
+from sklearn.linear_model import LogisticRegression  # noqa: E402
+from sklearn.model_selection import StratifiedGroupKFold  # noqa: E402
 
 TRAIN_PARQUET_PATH = Path("data/processed/train_cleaned_rolling_3yr.parquet")
 TEST_PARQUET_PATH = Path("data/processed/test_uncurated_rolling_3yr.parquet")
 
 
 @pytest.fixture
-def synthetic_mixed_cohort() -> tuple[
-    pd.DataFrame, np.ndarray, np.ndarray, pd.DataFrame, np.ndarray, np.ndarray
-]:
+def synthetic_mixed_cohort() -> (
+    tuple[pd.DataFrame, np.ndarray, np.ndarray, pd.DataFrame, np.ndarray, np.ndarray]
+):
     """Generate reproducible synthetic mixed cohort with patient clusters.
 
     Returns:
@@ -236,9 +235,10 @@ def test_oof_threshold_independence_from_test_labels(
     assert np.allclose(res_orig["oof_probs"], res_inv["oof_probs"])
 
 
-def test_group_kfold_patient_isolation(
-    synthetic_mixed_cohort: tuple[
+def test_static_fold_patient_isolation(
+    synthetic_partitioned_cohort: tuple[
         pd.DataFrame,
+        np.ndarray,
         np.ndarray,
         np.ndarray,
         pd.DataFrame,
@@ -246,13 +246,12 @@ def test_group_kfold_patient_isolation(
         np.ndarray,
     ],
 ) -> None:
-    """Assert GroupKFold guarantees zero patient identity overlap across folds."""
-    x_train, y_train, groups_train, _, _, _ = synthetic_mixed_cohort
-    gkf = GroupKFold(n_splits=5)
+    """Assert static folds guarantee zero patient identity overlap across folds."""
+    x_train, y_train, groups_train, folds_train, _, _, _ = synthetic_partitioned_cohort
 
-    for fold, (train_idx, val_idx) in enumerate(
-        gkf.split(x_train, y_train, groups=groups_train)
-    ):
+    for fold in range(5):
+        train_idx = np.where(folds_train != fold)[0]
+        val_idx = np.where(folds_train == fold)[0]
         train_pids = set(groups_train[train_idx])
         val_pids = set(groups_train[val_idx])
         overlap = train_pids.intersection(val_pids)
@@ -307,9 +306,9 @@ def test_infold_smote_nc_isolation(
     x_res, _ = sm.fit_resample(x_train, y_train)
     for col in ["bin_chf", "bin_cad", "bin_dm"]:
         unique_vals = set(x_res[col].unique())
-        assert unique_vals.issubset({0.0, 1.0, 0, 1}), (
-            f"Non-binary comorbidity generated: {unique_vals}"
-        )
+        assert unique_vals.issubset(
+            {0.0, 1.0, 0, 1}
+        ), f"Non-binary comorbidity generated: {unique_vals}"
 
 
 def test_static_fold_consumption(
@@ -506,17 +505,17 @@ def test_all_11_models_synthetic_battery(
         # Assert probabilities are valid and bounded in [0, 1]
         assert not np.isnan(test_probs).any(), f"NaNs in test probs for {name}"
         assert not np.isnan(oof_probs).any(), f"NaNs in OOF probs for {name}"
-        assert np.all((test_probs >= 0.0) & (test_probs <= 1.0)), (
-            f"Out of bounds prob for {name}"
-        )
-        assert np.all((oof_probs >= 0.0) & (oof_probs <= 1.0)), (
-            f"Out of bounds OOF prob for {name}"
-        )
+        assert np.all(
+            (test_probs >= 0.0) & (test_probs <= 1.0)
+        ), f"Out of bounds prob for {name}"
+        assert np.all(
+            (oof_probs >= 0.0) & (oof_probs <= 1.0)
+        ), f"Out of bounds OOF prob for {name}"
 
         # Assert threshold calibration
-        assert 0.05 <= res["optimal_threshold"] <= 0.95, (
-            f"Threshold out of bounds for {name}"
-        )
+        assert (
+            0.05 <= res["optimal_threshold"] <= 0.95
+        ), f"Threshold out of bounds for {name}"
         assert not np.isnan(res["oof_f1"])
 
         # Assert decisions are binary
@@ -530,8 +529,9 @@ def test_all_11_models_synthetic_battery(
 
 
 def test_visualizations_battery(
-    synthetic_mixed_cohort: tuple[
+    synthetic_partitioned_cohort: tuple[
         pd.DataFrame,
+        np.ndarray,
         np.ndarray,
         np.ndarray,
         pd.DataFrame,
@@ -540,7 +540,9 @@ def test_visualizations_battery(
     ],
 ) -> None:
     """Verify publication visualization routines generate valid figures."""
-    x_train, y_train, groups_train, x_test, y_test, _ = synthetic_mixed_cohort
+    x_train, y_train, groups_train, folds_train, x_test, y_test, _ = (
+        synthetic_partitioned_cohort
+    )
     cat_indices = identify_categorical_features(x_train)
 
     # Run lightweight benchmark
@@ -557,6 +559,7 @@ def test_visualizations_battery(
         models=models,
         categorical_indices=cat_indices,
         n_splits=5,
+        folds_train=folds_train,
     )
 
     test_pred_df = benchmark_res["test_predictions_df"]
@@ -620,9 +623,10 @@ def test_pipeline_named_steps_classifier() -> None:
     assert "clf" not in pipe.named_steps
 
 
-def test_group_kfold_validation_empirical_class_balance(
-    synthetic_mixed_cohort: tuple[
+def test_static_fold_validation_empirical_class_balance(
+    synthetic_partitioned_cohort: tuple[
         pd.DataFrame,
+        np.ndarray,
         np.ndarray,
         np.ndarray,
         pd.DataFrame,
@@ -630,19 +634,18 @@ def test_group_kfold_validation_empirical_class_balance(
         np.ndarray,
     ],
 ) -> None:
-    """Assert within GroupKFold validation folds preserve empirical class balance.
+    """Assert validation folds preserve empirical class balance under static folds.
 
     Validates Spec line 83: In-fold SMOTE-NC must only transform training
     partitions, leaving validation folds in their natural empirical distribution
     without synthetic samples.
     """
-    x_train, y_train, groups_train, _, _, _ = synthetic_mixed_cohort
+    x_train, y_train, groups_train, folds_train, _, _, _ = synthetic_partitioned_cohort
     cat_indices = identify_categorical_features(x_train)
 
-    gkf = GroupKFold(n_splits=5)
-    for _fold, (train_idx, val_idx) in enumerate(
-        gkf.split(x_train, y_train, groups=groups_train)
-    ):
+    for _fold in range(5):
+        train_idx = np.where(folds_train != _fold)[0]
+        val_idx = np.where(folds_train == _fold)[0]
         y_val_empirical = y_train[val_idx]
         val_empirical_positives = int(np.sum(y_val_empirical))
         val_empirical_total = len(y_val_empirical)
@@ -702,8 +705,9 @@ def test_identify_categorical_features_drops_target_and_id() -> None:
 
 
 def test_typed_benchmark_results(
-    synthetic_mixed_cohort: tuple[
+    synthetic_partitioned_cohort: tuple[
         pd.DataFrame,
+        np.ndarray,
         np.ndarray,
         np.ndarray,
         pd.DataFrame,
@@ -712,7 +716,9 @@ def test_typed_benchmark_results(
     ],
 ) -> None:
     """Verify evaluate_model_cv_and_test returns typed BenchmarkModelResult."""
-    x_train, y_train, groups_train, x_test, y_test, _ = synthetic_mixed_cohort
+    x_train, y_train, groups_train, folds_train, x_test, y_test, _ = (
+        synthetic_partitioned_cohort
+    )
     cat_indices = identify_categorical_features(x_train)
 
     pipe = create_smote_pipeline(
@@ -730,6 +736,7 @@ def test_typed_benchmark_results(
         x_test=x_test,
         y_test=y_test,
         n_splits=5,
+        folds_train=folds_train,
     )
 
     expected_keys = {
@@ -746,3 +753,48 @@ def test_typed_benchmark_results(
     }
     assert set(res.keys()) == expected_keys
     assert "classifier" in res["fitted_pipeline"].named_steps
+
+
+def test_static_folds_required_raises_error(
+    synthetic_mixed_cohort: tuple[
+        pd.DataFrame,
+        np.ndarray,
+        np.ndarray,
+        pd.DataFrame,
+        np.ndarray,
+        np.ndarray,
+    ],
+) -> None:
+    """Verify ValueError is raised when static folds are not provided."""
+    x_train, y_train, groups_train, x_test, y_test, _ = synthetic_mixed_cohort
+    cat_indices = identify_categorical_features(x_train)
+
+    pipe = create_smote_pipeline(
+        classifier=LogisticRegression(max_iter=1000, random_state=42),
+        categorical_indices=cat_indices,
+        random_state=42,
+    )
+
+    with pytest.raises(ValueError, match="Static folds must be provided"):
+        evaluate_model_cv_and_test(
+            model_name="LR_No_Folds",
+            pipeline=pipe,
+            x_train=x_train,
+            y_train=y_train,
+            groups_train=groups_train,
+            x_test=x_test,
+            y_test=y_test,
+            n_splits=5,
+        )
+
+    with pytest.raises(ValueError, match="Static folds must be provided"):
+        run_benchmark_suite(
+            x_train=x_train,
+            y_train=y_train,
+            groups_train=groups_train,
+            x_test=x_test,
+            y_test=y_test,
+            models={"LR": LogisticRegression(max_iter=1000, random_state=42)},
+            categorical_indices=cat_indices,
+            n_splits=5,
+        )

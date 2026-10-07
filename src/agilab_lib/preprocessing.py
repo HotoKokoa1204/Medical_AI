@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 import numpy as np
 import pandas as pd
@@ -561,6 +561,7 @@ class LongitudinalPreprocessor:
 
         self.cont_imputer: SimpleImputer = SimpleImputer(strategy="median")
         self.scaler: StandardScaler = StandardScaler()
+        self.assess_scaler: StandardScaler = StandardScaler()
         self.knn_imputer: KNNImputer = KNNImputer(
             n_neighbors=self.n_knn_neighbors, weights="distance"
         )
@@ -624,10 +625,19 @@ class LongitudinalPreprocessor:
             assess_train = df[self.retained_assess_cols].apply(
                 pd.to_numeric, errors="coerce"
             )
+            # Normalize assessment scores during KNN input conditioning so unscaled
+            # actAssess does not drown out biomarker distances
+            scaled_assess_train = pd.DataFrame(
+                self.assess_scaler.fit_transform(assess_train),
+                columns=self.retained_assess_cols,
+                index=df.index,
+            )
             if self.retained_cont_cols:
-                knn_train_data = pd.concat([scaled_cont_train, assess_train], axis=1)
+                knn_train_data = pd.concat(
+                    [scaled_cont_train, scaled_assess_train], axis=1
+                )
             else:
-                knn_train_data = assess_train
+                knn_train_data = scaled_assess_train
             self.knn_imputer.fit(knn_train_data)
 
         # 3. Discrete Features: Integer mode
@@ -702,14 +712,26 @@ class LongitudinalPreprocessor:
                     assess_subset[col] = pd.to_numeric(df[col], errors="coerce")
                 else:
                     assess_subset[col] = np.nan
+            scaled_assess_test = pd.DataFrame(
+                self.assess_scaler.transform(assess_subset),
+                columns=self.retained_assess_cols,
+                index=df.index,
+            )
             if self.retained_cont_cols:
-                knn_input_data = pd.concat([continuous_pca_df, assess_subset], axis=1)
+                knn_input_data = pd.concat(
+                    [continuous_pca_df, scaled_assess_test], axis=1
+                )
             else:
-                knn_input_data = assess_subset
+                knn_input_data = scaled_assess_test
             imputed_knn_arr = self.knn_imputer.transform(knn_input_data)
-            imputed_assess_arr = imputed_knn_arr[:, -len(self.retained_assess_cols) :]
+            imputed_assess_scaled = imputed_knn_arr[
+                :, -len(self.retained_assess_cols) :
+            ]
+            imputed_assess_orig = self.assess_scaler.inverse_transform(
+                imputed_assess_scaled
+            )
             assess_df = pd.DataFrame(
-                imputed_assess_arr,
+                imputed_assess_orig,
                 columns=self.retained_assess_cols,
                 index=df.index,
             )
@@ -980,9 +1002,9 @@ def partition_stratified_group_5fold(
     year_col: str = "year",
     n_splits: int = CV_N_SPLITS,
     random_state: int = CV_RANDOM_STATE,
-    patient_ids: Sequence | pd.Series | np.ndarray | None = None,
-    years: Sequence | pd.Series | np.ndarray | None = None,
-    targets: Sequence | pd.Series | np.ndarray | None = None,
+    patient_ids: Sequence[Any] | pd.Series | np.ndarray | None = None,
+    years: Sequence[Any] | pd.Series | np.ndarray | None = None,
+    targets: Sequence[Any] | pd.Series | np.ndarray | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Partition dataset into immutable stratified group k-folds.
 

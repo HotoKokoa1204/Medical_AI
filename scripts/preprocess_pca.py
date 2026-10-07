@@ -110,11 +110,13 @@ def main() -> int:
             / "AGILAB_MedicalAI"
             / "data"
             / "Kidit_Master_Baseline_V2.xlsx",
-            Path(
-                "E:/github/MedicalAI/AGILAB_MedicalAI/data/Kidit_Master_Baseline_V2.xlsx"
+            project_root.parent.parent / "data" / "Kidit_Master_Baseline_V2.xlsx",
+            (
+                project_root.parent
+                / "AGILAB_MedicalAI"
+                / "data"
+                / "Kidit_Master_Baseline_V2.xlsx"
             ),
-            Path("E:/github/Kidit_Master_Baseline_V2.xlsx"),
-            Path("E:/github/MedicalAI/data/Kidit_Master_Baseline_V2.xlsx"),
         ]
         data_path = next((p for p in candidates if p.exists()), candidates[0])
 

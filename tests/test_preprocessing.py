@@ -19,7 +19,6 @@ if src_path not in sys.path:
 import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 import pytest  # noqa: E402
-
 from agilab_lib.analysis import (  # noqa: E402
     calculate_hotelling_t2,
     calculate_spe,
@@ -55,15 +54,16 @@ from agilab_lib.visualization import (  # noqa: E402
     plot_t2_vs_spe,
 )
 
+_test_root = Path(__file__).resolve().parent.parent
 DATA_PATH_CANDIDATES = [
     Path("data/Kidit_Master_Baseline_V2.xlsx"),
-    Path(__file__).resolve().parent.parent.parent.parent
+    _test_root / "data" / "Kidit_Master_Baseline_V2.xlsx",
+    _test_root.parent.parent
     / "AGILAB_MedicalAI"
     / "data"
     / "Kidit_Master_Baseline_V2.xlsx",
-    Path("E:/github/MedicalAI/AGILAB_MedicalAI/data/Kidit_Master_Baseline_V2.xlsx"),
-    Path("E:/github/Kidit_Master_Baseline_V2.xlsx"),
-    Path("E:/github/MedicalAI/data/Kidit_Master_Baseline_V2.xlsx"),
+    _test_root.parent.parent / "data" / "Kidit_Master_Baseline_V2.xlsx",
+    _test_root.parent / "AGILAB_MedicalAI" / "data" / "Kidit_Master_Baseline_V2.xlsx",
 ]
 DATA_PATH = next(
     (p for p in DATA_PATH_CANDIDATES if p.exists()),
@@ -657,12 +657,10 @@ def test_partition_stratified_group_5fold_missing_year() -> None:
 PROCESSED_DATA_DIR = Path("data/processed")
 if not (PROCESSED_DATA_DIR / "train_cleaned_rolling_3yr.parquet").exists():
     for candidate_dir in [
-        Path(__file__).resolve().parent.parent / "data" / "processed",
-        Path(__file__).resolve().parent.parent.parent.parent
-        / "AGILAB_MedicalAI"
-        / "data"
-        / "processed",
-        Path("E:/github/MedicalAI/AGILAB_MedicalAI/data/processed"),
+        _test_root / "data" / "processed",
+        _test_root.parent.parent / "AGILAB_MedicalAI" / "data" / "processed",
+        _test_root.parent.parent / "data" / "processed",
+        _test_root.parent / "AGILAB_MedicalAI" / "data" / "processed",
     ]:
         if (candidate_dir / "train_cleaned_rolling_3yr.parquet").exists():
             PROCESSED_DATA_DIR = candidate_dir
@@ -757,9 +755,9 @@ def test_invariant_3_zero_patient_leakage_across_folds() -> None:
         for j in range(i + 1, 5):
             pids_j = set(df_audit.loc[df_audit["fold"] == j, "PatientID"])
             overlap = pids_i.intersection(pids_j)
-            assert len(overlap) == 0, (
-                f"Patient leakage between fold {i} and {j}: {overlap}"
-            )
+            assert (
+                len(overlap) == 0
+            ), f"Patient leakage between fold {i} and {j}: {overlap}"
 
     # Verify total unique patients equals sum across folds
     total_unique_pids = df_audit["PatientID"].nunique()
@@ -792,9 +790,9 @@ def test_invariant_4_complete_coverage_and_valid_folds() -> None:
         assert (y_fold == 1).sum() > 0, f"Fold {f} has no death events!"
         assert (y_fold == 0).sum() > 0, f"Fold {f} has no survivor records!"
         death_rate = float(y_fold.mean())
-        assert 0.10 <= death_rate <= 0.30, (
-            f"Fold {f} death rate {death_rate:.2%} is severely imbalanced!"
-        )
+        assert (
+            0.10 <= death_rate <= 0.30
+        ), f"Fold {f} death rate {death_rate:.2%} is severely imbalanced!"
 
 
 def test_invariant_5_feature_separation_quarantine() -> None:
@@ -821,9 +819,9 @@ def test_invariant_5_feature_separation_quarantine() -> None:
 
     # All columns in x_features must be numeric
     for col in x_features.columns:
-        assert np.issubdtype(x_features[col].dtype, np.number), (
-            f"Column {col} is non-numeric!"
-        )
+        assert np.issubdtype(
+            x_features[col].dtype, np.number
+        ), f"Column {col} is non-numeric!"
 
 
 def test_invariant_6_test_set_isolation() -> None:

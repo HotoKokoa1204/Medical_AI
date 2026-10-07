@@ -34,7 +34,6 @@ from sklearn.metrics import (
     recall_score,
     roc_auc_score,
 )
-from sklearn.model_selection import GroupKFold
 from sklearn.naive_bayes import GaussianNB
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.svm import SVC
@@ -62,6 +61,22 @@ QUARANTINE_COLUMNS: tuple[str, ...] = (
     "PatientID",
     "fold",
 )
+
+
+def quarantine_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop quarantined metadata and target columns from feature DataFrame.
+
+    Excludes columns in QUARANTINE_COLUMNS (such as 'is_death_3yr', 'is_death',
+    'PatientID', and 'fold') if present, returning a cleaned feature DataFrame.
+
+    Args:
+        df: Input DataFrame potentially containing quarantined columns.
+
+    Returns:
+        DataFrame with quarantined columns removed.
+    """
+    cols_to_drop = [c for c in QUARANTINE_COLUMNS if c in df.columns]
+    return df.drop(columns=cols_to_drop) if cols_to_drop else df
 
 
 class BenchmarkModelResult(TypedDict):
@@ -187,8 +202,7 @@ def identify_categorical_features(
     Returns:
         List of 0-based integer column indices corresponding to categorical features.
     """
-    cols_to_drop = [c for c in QUARANTINE_COLUMNS if c in df.columns]
-    feature_df = df.drop(columns=cols_to_drop) if cols_to_drop else df
+    feature_df = quarantine_features(df)
 
     disc_set = set(
         discrete_columns if discrete_columns is not None else DEFAULT_DISCRETE_COLUMNS
@@ -371,9 +385,8 @@ def evaluate_model_cv_and_test(
 ) -> BenchmarkModelResult:
     """Execute cross-validation, OOF threshold tuning, and test inference.
 
-    Supports static pre-assigned folds (`folds_train` or embedded 'fold' column)
-    or fallback dynamic GroupKFold splitting by `groups_train`. Eliminates dynamic
-    GroupKFold generation when static folds are provided. Automatically quarantines
+    Requires static pre-assigned folds (`folds_train` or embedded 'fold' column).
+    Eliminates dynamic cross-validation fold generation. Automatically quarantines
     'fold', 'PatientID', 'is_death_3yr', and 'is_death' from feature matrix X.
     Always asserts zero subject/patient identity leakage across train and val splits
     whenever patient group identifiers are provided.
@@ -384,7 +397,7 @@ def evaluate_model_cv_and_test(
         x_train: Training feature DataFrame.
         y_train: Training binary target series/array.
         groups_train: Optional patient grouping identifiers for training records.
-            Used to assert zero subject leakage or for fallback GroupKFold.
+            Used to assert zero subject leakage across folds.
         x_test: Uncurated test feature DataFrame.
         y_test: Test binary target series/array.
         n_splits: Number of cross-validation folds (default 5).
@@ -397,8 +410,8 @@ def evaluate_model_cv_and_test(
         and optimal thresholds.
 
     Raises:
-        ValueError: If neither folds_train nor groups_train can be resolved,
-            or if x_test/y_test are None, or if NaNs are produced.
+        ValueError: If static folds cannot be resolved, or if x_test/y_test are None,
+            or if NaNs are produced.
         RuntimeError: If patient identity overlap is detected between train and
             validation partitions.
     """
@@ -412,6 +425,11 @@ def evaluate_model_cv_and_test(
     elif isinstance(x_train, pd.DataFrame) and "fold" in x_train.columns:
         folds = x_train["fold"].to_numpy()
 
+    if folds is None:
+        raise ValueError(
+            "Static folds must be provided via folds_train or 'fold' column in x_train."
+        )
+
     groups: np.ndarray | None = None
     if groups_train is not None:
         groups = np.asarray(groups_train)
@@ -419,36 +437,23 @@ def evaluate_model_cv_and_test(
         groups = x_train["PatientID"].to_numpy()
 
     # 2. Strict quarantine of metadata columns from feature matrix X
-    drop_tr = [c for c in QUARANTINE_COLUMNS if c in x_train.columns]
-    x_tr_clean = x_train.drop(columns=drop_tr) if drop_tr else x_train
-
-    drop_te = [c for c in QUARANTINE_COLUMNS if c in x_test.columns]
-    x_te_clean = x_test.drop(columns=drop_te) if drop_te else x_test
+    x_tr_clean = quarantine_features(x_train)
+    x_te_clean = quarantine_features(x_test)
 
     y_tr = np.asarray(y_train, dtype=int)
     y_te = np.asarray(y_test, dtype=int)
 
     # 3. Cross-validation partition construction
     splits: list[tuple[np.ndarray, np.ndarray]] = []
-    if folds is not None:
-        # Eliminate dynamic GroupKFold generation when static folds are provided.
-        # Iterate directly over static fold indices (0 to n_splits-1):
-        for fold_idx in range(n_splits):
-            train_idx = np.where(folds != fold_idx)[0]
-            val_idx = np.where(folds == fold_idx)[0]
-            if len(val_idx) == 0:
-                raise ValueError(
-                    f"Static fold {fold_idx} contains zero validation samples."
-                )
-            splits.append((train_idx, val_idx))
-    elif groups is not None:
-        gkf = GroupKFold(n_splits=n_splits)
-        splits = list(gkf.split(x_tr_clean, y_tr, groups=groups))
-    else:
-        raise ValueError(
-            "Either folds_train (or 'fold' column in x_train) or groups_train "
-            "must be provided."
-        )
+    # Iterate directly over static fold indices (0 to n_splits-1):
+    for fold_idx in range(n_splits):
+        train_idx = np.where(folds != fold_idx)[0]
+        val_idx = np.where(folds == fold_idx)[0]
+        if len(val_idx) == 0:
+            raise ValueError(
+                f"Static fold {fold_idx} contains zero validation samples."
+            )
+        splits.append((train_idx, val_idx))
 
     oof_probs = np.full(len(y_tr), np.nan, dtype=float)
 
@@ -560,7 +565,8 @@ def run_benchmark_suite(
             - results: Detailed BenchmarkModelResult dictionary per model.
 
     Raises:
-        ValueError: If x_test or y_test are not provided.
+        ValueError: If x_test or y_test are not provided, or if static folds
+            cannot be resolved from inputs.
     """
     if x_test is None or y_test is None:
         raise ValueError("x_test and y_test must be provided for benchmark suite.")
@@ -575,6 +581,11 @@ def run_benchmark_suite(
     elif isinstance(x_train, pd.DataFrame) and "fold" in x_train.columns:
         folds = x_train["fold"].to_numpy()
 
+    if folds is None:
+        raise ValueError(
+            "Static folds must be provided via folds_train or 'fold' column in x_train."
+        )
+
     groups: np.ndarray | None = None
     if groups_train is not None:
         groups = np.asarray(groups_train)
@@ -582,11 +593,8 @@ def run_benchmark_suite(
         groups = x_train["PatientID"].to_numpy()
 
     # Quarantine metadata columns from feature matrices
-    drop_tr = [c for c in QUARANTINE_COLUMNS if c in x_train.columns]
-    x_tr_clean = x_train.drop(columns=drop_tr) if drop_tr else x_train
-
-    drop_te = [c for c in QUARANTINE_COLUMNS if c in x_test.columns]
-    x_te_clean = x_test.drop(columns=drop_te) if drop_te else x_test
+    x_tr_clean = quarantine_features(x_train)
+    x_te_clean = quarantine_features(x_test)
 
     if categorical_indices is None:
         categorical_indices = identify_categorical_features(x_tr_clean)

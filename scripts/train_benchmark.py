@@ -142,8 +142,11 @@ def load_patient_groups(
     # Fallback to workbook if mapping not found
     workbook_candidates = [
         root / "data" / "Kidit_Master_Baseline_V2.xlsx",
-        Path("E:/github/Kidit_Master_Baseline_V2.xlsx"),
-        Path("E:/github/MedicalAI/data/Kidit_Master_Baseline_V2.xlsx"),
+        root.parent.parent
+        / "AGILAB_MedicalAI"
+        / "data"
+        / "Kidit_Master_Baseline_V2.xlsx",
+        root.parent.parent / "data" / "Kidit_Master_Baseline_V2.xlsx",
     ]
     for wb in workbook_candidates:
         if wb.exists():
@@ -308,8 +311,12 @@ def main() -> int:
 
     target_col = "is_death_3yr" if "is_death_3yr" in train_df.columns else "is_death"
 
-    # Consume static fold assignments if present in training parquet
-    train_folds = train_df["fold"].values if "fold" in train_df.columns else None
+    # Require static fold assignments in training parquet
+    if "fold" not in train_df.columns:
+        raise ValueError(
+            f"Training dataset at {train_path} must contain static 'fold' column."
+        )
+    train_folds = train_df["fold"].values
 
     # Strict feature quarantine: drop targets, PatientID, and fold
     drop_tr = [c for c in (target_col, "PatientID", "fold") if c in train_df.columns]
@@ -344,9 +351,9 @@ def main() -> int:
     print(f"  [OK] Unique Training Patients: {n_unique_patients}")
 
     overlap_patients = set(train_groups).intersection(set(test_groups))
-    assert len(overlap_patients) == 0, (
-        f"Subject leakage detected: {len(overlap_patients)} overlap!"
-    )
+    assert (
+        len(overlap_patients) == 0
+    ), f"Subject leakage detected: {len(overlap_patients)} overlap!"
     print(
         "  [OK] Patient Grouping Isolation Verified: "
         "Train Patients ∩ Test Patients == ∅"
@@ -365,11 +372,7 @@ def main() -> int:
     )
 
     # 4. Execute 11-Algorithm Benchmark
-    scheme_str = (
-        f"{args.n_splits}-Fold Static CV"
-        if train_folds is not None
-        else f"{args.n_splits}-Fold Dynamic GroupKFold CV"
-    )
+    scheme_str = f"{args.n_splits}-Fold Static CV"
     print(
         f"\n[Step 4/5] Executing 11-Model Benchmark Suite "
         f"({scheme_str} + In-Fold SMOTE-NC)..."
@@ -390,10 +393,19 @@ def main() -> int:
 
     metrics_df = results["metrics_df"]
     test_pred_df = results["test_predictions_df"]
+    oof_pred_df = results["oof_predictions_df"]
     fitted_pipelines = results["fitted_pipelines"]
 
     # 5. Persist Deliverables
     print("\n[Step 5/5] Persisting model predictions, checkpoints, and figures...")
+
+    # Save OOF predictions parquet
+    oof_pred_path = output_dir / "model_predictions_oof.parquet"
+    oof_pred_df.to_parquet(oof_pred_path, engine="pyarrow", index=True)
+    print(
+        f"  [OK] Saved OOF Predictions Matrix:  {oof_pred_path} "
+        f"(Shape: {oof_pred_df.shape})"
+    )
 
     # Save test predictions parquet
     pred_path = output_dir / "model_predictions_test.parquet"

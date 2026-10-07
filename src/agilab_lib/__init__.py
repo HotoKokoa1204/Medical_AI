@@ -16,6 +16,7 @@ from agilab_lib.analysis import (
 )
 from agilab_lib.modeling import (
     DEFAULT_DISCRETE_COLUMNS,
+    QUARANTINE_COLUMNS,
     BenchmarkModelResult,
     BenchmarkSuiteResult,
     calculate_metrics,
@@ -24,6 +25,7 @@ from agilab_lib.modeling import (
     find_optimal_threshold,
     get_model_zoo,
     identify_categorical_features,
+    quarantine_features,
     run_benchmark_suite,
 )
 from agilab_lib.preprocessing import (
@@ -97,6 +99,8 @@ __all__ = [
     "calculate_metrics",
     "evaluate_model_cv_and_test",
     "run_benchmark_suite",
+    "quarantine_features",
+    "QUARANTINE_COLUMNS",
     "BenchmarkModelResult",
     "BenchmarkSuiteResult",
     "TARGET_LEAKAGE_COLUMNS",
