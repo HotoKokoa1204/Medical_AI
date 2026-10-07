@@ -2,52 +2,32 @@
 
 ## Cohort & Methodology Summary
 - **Cohort**: Longitudinal Hemodialysis Rolling 3-Year Dynamic Cohort
-- **Training Records**: 3,737 observations (purified via multivariate $T^2$ & Jackson-Mudholkar SPE)
-- **Uncurated Test Records**: 1,112 observations (100% unpruned, zero synthetic distortion)
-- **Test Set Ground Truth**: 197 Deceased (17.72%), 915 Survived (82.28%)
-- **Validation Scheme**: 5-Fold `GroupKFold` strictly partitioned by `PatientID` (zero cross-fold identity leakage)
-- **Resampling**: In-Fold `SMOTE-NC` (spatial interpolation for continuous analytes, mode assignment for discrete flags)
-- **Threshold Calibration**: Optimal cutoff $T^* \in [0.05, 0.95]$ (step 0.01) maximizing F1-score strictly on Out-of-Fold (OOF) predictions
-- **Blinding Principle**: Test labels strictly isolated and untouched during all preprocessing, tuning, and threshold selection
+- **Training Records**: 3,737 observations (purified via $T^2$ & SPE)
+- **Uncurated Test Records**: 1,112 observations (100% unpruned)
+- **Validation Scheme**: 5-Fold Stratified Group Partition (`PatientID`)
+- **Resampling**: In-Fold `SMOTE-NC` (mode for discrete flags)
+- **Threshold Calibration**: Optimal cutoff $T^* \in [0.05, 0.95]$ on OOF
+- **Blinding Principle**: Test labels isolated and untouched
 
-## Performance Leaderboard (Ranked by ROC-AUC, with Explicit Recall & Precision)
+## Performance Leaderboard (Ranked by ROC-AUC)
 
-| Rank | Model | Optimal $T^*$ | ROC-AUC | PR-AUC | Brier | Recall / Sens ($T^*$) | True Positives (TP / 197) | Precision ($T^*$) | False Positives (FP) | Spec ($T^*$) | F1 ($T^*$) | Acc ($T^*$) | Kappa ($T^*$) |
-|:---:|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| 🥇 | **Random Forest** | `0.52` | **0.9186** | 0.6886 | 0.1036 | 70.6% | 139 / 197 | **67.1%** | **68** | **0.9257** | **0.6881** | **0.8867** | **0.6189** |
-| 🥈 | **CatBoost** | `0.38` | **0.9177** | **0.7157** | **0.0831** | **75.1%** | **148 / 197** | 62.7% | 88 | 0.9038 | 0.6836 | 0.8768 | 0.6079 |
-| 🥉 | **AdaBoost** | `0.51` | 0.9147 | 0.6920 | 0.1892 | 68.0% | 134 / 197 | 61.5% | 84 | 0.9082 | 0.6458 | 0.8678 | 0.5648 |
-| 4 | **XGBoost** | `0.41` | 0.9067 | 0.7086 | 0.0879 | 70.1% | 138 / 197 | 63.0% | 81 | 0.9115 | 0.6635 | 0.8741 | 0.5863 |
-| 5 | **Extra Trees** | `0.50` | 0.9049 | 0.6777 | 0.1180 | 71.6% | 141 / 197 | 63.5% | 81 | 0.9115 | 0.6730 | 0.8768 | 0.5975 |
-| 6 | **Gradient Boosting** | `0.44` | 0.9017 | 0.6960 | 0.0929 | 70.1% | 138 / 197 | 63.3% | 80 | 0.9126 | 0.6651 | 0.8750 | 0.5885 |
-| 7 | **Logistic Regression** | `0.58` | 0.8911 | 0.6612 | 0.1085 | 61.4% | 121 / 197 | 58.5% | 86 | 0.9060 | 0.5990 | 0.8543 | 0.5101 |
-| 8 | **SVM** | `0.64` | 0.8226 | 0.6045 | 0.2028 | 73.1% | 144 / 197 | 31.3% | 316 | 0.6546 | 0.4384 | 0.6682 | 0.2531 |
-| 9 | **KNN** | `0.72` | 0.8107 | 0.4850 | 0.1806 | 54.8% | 108 / 197 | 52.7% | 97 | 0.8940 | 0.5373 | 0.8327 | 0.4353 |
-| 10 | **GaussianNB** | `0.95` | 0.7970 | 0.5108 | 0.2377 | 68.5% | 135 / 197 | 41.3% | 192 | 0.7902 | 0.5153 | 0.7716 | 0.3777 |
-| 11 | **Decision Tree** | `0.38` | 0.7871 | 0.4284 | 0.1492 | 71.6% | 141 / 197 | 43.4% | 184 | 0.7989 | 0.5402 | 0.7842 | 0.4101 |
-
----
-
-## Default Threshold ($T=0.50$) Comparison (Ranked by ROC-AUC)
-
-| Rank | Model | ROC-AUC | PR-AUC | Brier | Recall / Sens ($T=0.5$) | True Positives (TP / 197) | Precision ($T=0.5$) | False Positives (FP) | Spec ($T=0.5$) | F1 ($T=0.5$) | Acc ($T=0.5$) | Kappa ($T=0.5$) |
-|:---:|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| 🥇 | **Random Forest** | **0.9186** | 0.6886 | 0.1036 | 72.1% | 142 / 197 | 64.5% | 78 | 0.9148 | 0.6811 | 0.8804 | 0.6077 |
-| 🥈 | **CatBoost** | **0.9177** | **0.7157** | **0.0831** | 69.5% | 137 / 197 | **69.5%** | **60** | **0.9344** | **0.6954** | **0.8921** | **0.6299** |
-| 🥉 | **AdaBoost** | 0.9147 | 0.6920 | 0.1892 | **75.6%** | **149 / 197** | 58.4% | 106 | 0.8842 | 0.6593 | 0.8615 | 0.5742 |
-| 4 | **XGBoost** | 0.9067 | 0.7086 | 0.0879 | 66.0% | 130 / 197 | 67.4% | 63 | 0.9311 | 0.6667 | 0.8831 | 0.5958 |
-| 5 | **Extra Trees** | 0.9049 | 0.6777 | 0.1180 | 71.6% | 141 / 197 | 63.5% | 81 | 0.9115 | 0.6730 | 0.8768 | 0.5975 |
-| 6 | **Gradient Boosting** | 0.9017 | 0.6960 | 0.0929 | 67.5% | 133 / 197 | 64.6% | 73 | 0.9202 | 0.6600 | 0.8768 | 0.5849 |
-| 7 | **Logistic Regression** | 0.8911 | 0.6612 | 0.1085 | 66.5% | 131 / 197 | 56.2% | 102 | 0.8885 | 0.6093 | 0.8489 | 0.5165 |
-| 8 | **SVM** | 0.8226 | 0.6045 | 0.2028 | 73.1% | 144 / 197 | 31.2% | 317 | 0.6536 | 0.4377 | 0.6673 | 0.2520 |
-| 9 | **KNN** | 0.8107 | 0.4850 | 0.1806 | 73.6% | 145 / 197 | 39.7% | 220 | 0.7596 | 0.5160 | 0.7554 | 0.3714 |
-| 10 | **GaussianNB** | 0.7970 | 0.5108 | 0.2377 | 69.5% | 137 / 197 | 39.0% | 214 | 0.7661 | 0.5000 | 0.7536 | 0.3532 |
-| 11 | **Decision Tree** | 0.7871 | 0.4284 | 0.1492 | 64.5% | 127 / 197 | 47.6% | 140 | 0.8470 | 0.5474 | 0.8112 | 0.4315 |
-
----
+| Model | Optimal $T^*$ | ROC-AUC | PR-AUC | Brier | Acc ($T=0.5$) | Sens ($T=0.5$) | Spec ($T=0.5$) | F1 ($T=0.5$) | Kappa ($T=0.5$) | Acc ($T^*$) | Sens ($T^*$) | Spec ($T^*$) | F1 ($T^*$) | Kappa ($T^*$) |
+|:---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
+| **Random Forest** | `0.50` | 0.9211 | 0.6873 | 0.1039 | 0.8822 | 0.7157 | 0.9180 | 0.6828 | 0.6107 | 0.8822 | 0.7157 | 0.9180 | 0.6828 | 0.6107 |
+| **CatBoost** | `0.42` | 0.9158 | 0.7109 | 0.0822 | 0.8939 | 0.6954 | 0.9366 | 0.6990 | 0.6346 | 0.8876 | 0.7360 | 0.9202 | 0.6988 | 0.6299 |
+| **XGBoost** | `0.46` | 0.9120 | 0.7209 | 0.0826 | 0.8921 | 0.6954 | 0.9344 | 0.6954 | 0.6299 | 0.8885 | 0.7107 | 0.9268 | 0.6931 | 0.6250 |
+| **AdaBoost** | `0.51` | 0.9095 | 0.6799 | 0.1896 | 0.8579 | 0.7259 | 0.8863 | 0.6441 | 0.5568 | 0.8633 | 0.6650 | 0.9060 | 0.6329 | 0.5491 |
+| **Extra Trees** | `0.48` | 0.9035 | 0.6808 | 0.1199 | 0.8741 | 0.7208 | 0.9071 | 0.6698 | 0.5925 | 0.8660 | 0.7563 | 0.8896 | 0.6667 | 0.5843 |
+| **Gradient Boosting** | `0.44` | 0.9012 | 0.7034 | 0.0896 | 0.8786 | 0.6904 | 0.9191 | 0.6683 | 0.5941 | 0.8741 | 0.7310 | 0.9049 | 0.6729 | 0.5956 |
+| **Logistic Regression** | `0.48` | 0.8910 | 0.7020 | 0.1055 | 0.8561 | 0.6751 | 0.8951 | 0.6244 | 0.5360 | 0.8534 | 0.6853 | 0.8896 | 0.6236 | 0.5335 |
+| **KNN** | `0.58` | 0.8192 | 0.4841 | 0.1810 | 0.7572 | 0.7665 | 0.7552 | 0.5280 | 0.3851 | 0.7986 | 0.6853 | 0.8230 | 0.5466 | 0.4238 |
+| **SVM** | `0.67` | 0.8159 | 0.5501 | 0.1980 | 0.6673 | 0.7310 | 0.6536 | 0.4377 | 0.2520 | 0.8309 | 0.5228 | 0.8973 | 0.5228 | 0.4201 |
+| **Decision Tree** | `0.59` | 0.8051 | 0.4827 | 0.1387 | 0.8219 | 0.7056 | 0.8470 | 0.5840 | 0.4750 | 0.8219 | 0.7056 | 0.8470 | 0.5840 | 0.4750 |
+| **GaussianNB** | `0.95` | 0.7971 | 0.5103 | 0.1937 | 0.8004 | 0.6599 | 0.8306 | 0.5394 | 0.4174 | 0.8129 | 0.6497 | 0.8481 | 0.5517 | 0.4369 |
 
 ## Anti-Leakage Audit Trail
-- [x] Uncurated test set sample count strictly equals 1,112 (zero synthetic instances, zero dropped rows).
-- [x] Grouped patient cross-validation: Train $\cap$ Test patient IDs = $\emptyset$.
-- [x] In-fold SMOTE-NC isolation: Resampling occurs strictly inside each CV training fold and on full train set.
-- [x] Out-of-fold threshold calibration: $T^*$ selected purely on OOF probabilities with test labels completely blinded.
+- [x] Uncurated test set count strictly 1,112 (zero synthetic instances).
+- [x] Patient isolation: Train $\cap$ Test patient IDs = $\emptyset$.
+- [x] In-fold SMOTE-NC: Resampling strictly inside CV training folds.
+- [x] Out-of-fold threshold: $T^*$ selected purely on OOF probabilities.
+- [x] Static fold consumption: 5-fold partition with zero leakage.
