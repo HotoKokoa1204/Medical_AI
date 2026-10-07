@@ -65,4 +65,11 @@ venv.bak/
 # Tools
 .ruff_cache/
 .pytest_cache/
+.scratch/
 .mypy_cache/
+
+# CatBoost
+catboost_info/
+
+# Model Checkpoints
+models/checkpoints/*.joblib

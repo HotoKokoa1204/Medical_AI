@@ -8,7 +8,7 @@ Description: Publication-grade visualization utilities for PCA and clinical data
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Sequence
+from typing import Any, Sequence
 
 import matplotlib
 import matplotlib.patches as patches
@@ -17,8 +17,21 @@ import numpy as np
 import pandas as pd
 from scipy.stats import chi2
 from sklearn.decomposition import PCA
+from sklearn.metrics import (
+    auc,
+    average_precision_score,
+    precision_recall_curve,
+    roc_curve,
+)
 
 matplotlib.use("Agg")
+plt.rcParams["font.sans-serif"] = [
+    "Microsoft JhengHei",
+    "SimHei",
+    "DejaVu Sans",
+    "sans-serif",
+]
+plt.rcParams["axes.unicode_minus"] = False
 
 
 def plot_scree(
@@ -561,6 +574,365 @@ def plot_t2_vs_spe(
 
     ax.legend(loc="upper right", framealpha=0.9, fontsize=9)
     ax.grid(True, linestyle="--", alpha=0.3)
+    fig.tight_layout()
+
+    if save_path is not None:
+        p = Path(save_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(p, dpi=dpi, bbox_inches="tight")
+
+    return fig
+
+
+def _parse_model_probabilities(
+    probabilities: dict[str, Sequence[float] | np.ndarray] | pd.DataFrame,
+) -> dict[str, np.ndarray]:
+    """Parse and normalize model name to predicted probability arrays.
+
+    Args:
+        probabilities: Dictionary or DataFrame mapping model names to predicted
+            probabilities.
+
+    Returns:
+        Dictionary mapping model names to float numpy arrays of predicted probabilities.
+    """
+    prob_dict: dict[str, np.ndarray] = {}
+    if isinstance(probabilities, pd.DataFrame):
+        for col in probabilities.columns:
+            if col in ("is_death_3yr", "is_death"):
+                continue
+            if col.endswith("_prob"):
+                name = col[:-5].replace("_", " ").title()
+            elif "_pred" in col:
+                continue
+            else:
+                name = col
+            prob_dict[name] = np.asarray(probabilities[col], dtype=float)
+    else:
+        for name, probs in probabilities.items():
+            prob_dict[name] = np.asarray(probs, dtype=float)
+    return prob_dict
+
+
+def plot_benchmark_roc_curves(
+    y_true: Sequence[int] | np.ndarray,
+    probabilities: dict[str, Sequence[float] | np.ndarray] | pd.DataFrame,
+    save_path: Path | str | None = None,
+    dpi: int = 300,
+) -> plt.Figure:
+    """Plot overlaid ROC curves for benchmark models with AUC annotations.
+
+    Includes 300 DPI publication styling and dashed random chance diagonal line.
+
+    Args:
+        y_true: True binary target array (0 = Alive, 1 = Deceased).
+        probabilities: Dictionary or DataFrame mapping model names to predicted
+            probabilities.
+        save_path: Optional path to save the output figure image.
+        dpi: Output image resolution (default 300).
+
+    Returns:
+        matplotlib.pyplot.Figure object.
+    """
+    y_t = np.asarray(y_true, dtype=int)
+    prob_dict = _parse_model_probabilities(probabilities)
+
+    # Compute ROC curves and AUCs
+    curves: list[tuple[str, np.ndarray, np.ndarray, float]] = []
+    for name, probs in prob_dict.items():
+        fpr, tpr, _ = roc_curve(y_t, probs)
+        roc_auc = float(auc(fpr, tpr))
+        curves.append((name, fpr, tpr, roc_auc))
+
+    # Sort descending by AUC
+    curves.sort(key=lambda x: x[3], reverse=True)
+
+    fig, ax = plt.subplots(figsize=(8.5, 7.0), dpi=dpi)
+
+    cmap = plt.cm.tab20(np.linspace(0, 1, max(len(curves), 12)))
+
+    for idx, (name, fpr, tpr, roc_auc) in enumerate(curves):
+        color = cmap[idx % len(cmap)]
+        ax.plot(
+            fpr,
+            tpr,
+            label=f"{name} (AUC = {roc_auc:.3f})",
+            linewidth=1.9,
+            color=color,
+            alpha=0.9,
+        )
+
+    # Random chance reference line
+    ax.plot(
+        [0, 1],
+        [0, 1],
+        linestyle="--",
+        color="#64748b",
+        linewidth=1.5,
+        label="Random Chance (AUC = 0.500)",
+    )
+
+    ax.set_xlim(-0.02, 1.02)
+    ax.set_ylim(-0.02, 1.02)
+    ax.set_xlabel(
+        "False Positive Rate (1 - Specificity)",
+        fontsize=11,
+        fontweight="bold",
+    )
+    ax.set_ylabel(
+        "True Positive Rate (Sensitivity / Recall)",
+        fontsize=11,
+        fontweight="bold",
+    )
+    ax.set_title(
+        "11-Algorithm Benchmark: Receiver Operating Characteristic (ROC) Curves\n"
+        "(Hemodialysis 3-Year Mortality Cohort)",
+        fontsize=12,
+        fontweight="bold",
+        pad=12,
+    )
+    ax.legend(loc="lower right", framealpha=0.92, fontsize=8.5)
+    ax.grid(True, linestyle="--", alpha=0.3)
+    fig.tight_layout()
+
+    if save_path is not None:
+        p = Path(save_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(p, dpi=dpi, bbox_inches="tight")
+
+    return fig
+
+
+def plot_benchmark_pr_curves(
+    y_true: Sequence[int] | np.ndarray,
+    probabilities: dict[str, Sequence[float] | np.ndarray] | pd.DataFrame,
+    save_path: Path | str | None = None,
+    dpi: int = 300,
+) -> plt.Figure:
+    """Plot overlaid Precision-Recall (PR) curves for benchmark models with PR-AUC.
+
+    Includes horizontal baseline event rate line and 300 DPI publication styling.
+
+    Args:
+        y_true: True binary target array (0 = Alive, 1 = Deceased).
+        probabilities: Dictionary or DataFrame mapping model names to predicted
+            probabilities.
+        save_path: Optional path to save the output figure image.
+        dpi: Output image resolution (default 300).
+
+    Returns:
+        matplotlib.pyplot.Figure object.
+    """
+    y_t = np.asarray(y_true, dtype=int)
+    prob_dict = _parse_model_probabilities(probabilities)
+
+    # Compute PR curves and PR-AUCs
+    curves: list[tuple[str, np.ndarray, np.ndarray, float]] = []
+    for name, probs in prob_dict.items():
+        precision, recall, _ = precision_recall_curve(y_t, probs)
+        pr_auc = float(average_precision_score(y_t, probs))
+        curves.append((name, precision, recall, pr_auc))
+
+    # Sort descending by PR-AUC
+    curves.sort(key=lambda x: x[3], reverse=True)
+
+    fig, ax = plt.subplots(figsize=(8.5, 7.0), dpi=dpi)
+
+    cmap = plt.cm.tab20(np.linspace(0, 1, max(len(curves), 12)))
+
+    for idx, (name, precision, recall, pr_auc) in enumerate(curves):
+        color = cmap[idx % len(cmap)]
+        ax.plot(
+            recall,
+            precision,
+            label=f"{name} (PR-AUC = {pr_auc:.3f})",
+            linewidth=1.9,
+            color=color,
+            alpha=0.9,
+        )
+
+    # Baseline event rate horizontal line
+    baseline_rate = float(np.mean(y_t)) if len(y_t) > 0 else 0.0
+    ax.axhline(
+        baseline_rate,
+        linestyle="--",
+        color="#64748b",
+        linewidth=1.5,
+        label=f"Baseline Event Rate ({baseline_rate:.3f})",
+    )
+
+    ax.set_xlim(-0.02, 1.02)
+    ax.set_ylim(-0.02, 1.02)
+    ax.set_xlabel(
+        "Recall (Sensitivity)",
+        fontsize=11,
+        fontweight="bold",
+    )
+    ax.set_ylabel(
+        "Precision (Positive Predictive Value)",
+        fontsize=11,
+        fontweight="bold",
+    )
+    ax.set_title(
+        "11-Algorithm Benchmark: Precision-Recall (PR) Curves\n"
+        "(Hemodialysis 3-Year Mortality Cohort)",
+        fontsize=12,
+        fontweight="bold",
+        pad=12,
+    )
+    ax.legend(loc="upper right", framealpha=0.92, fontsize=8.5)
+    ax.grid(True, linestyle="--", alpha=0.3)
+    fig.tight_layout()
+
+    if save_path is not None:
+        p = Path(save_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(p, dpi=dpi, bbox_inches="tight")
+
+    return fig
+
+
+def plot_top_feature_importance(
+    models: dict[str, Any],
+    feature_names: Sequence[str] | pd.DataFrame,
+    y: Sequence[Any] | None = None,
+    top_models: Sequence[str] | None = None,
+    top_n: int = 15,
+    save_path: Path | str | None = None,
+    dpi: int = 300,
+) -> plt.Figure:
+    """Plot horizontal bar charts showing Top 15 feature importances for top models.
+
+    Args:
+        models: Dictionary mapping model names to fitted pipelines or estimators.
+        feature_names: Names of features or DataFrame whose columns define
+            feature names.
+        y: Optional target array (retained for signature compatibility).
+        top_models: Sequence of model names to plot. If None, selects up to 3 models
+            having feature_importances_ or get_feature_importance().
+        top_n: Number of leading features to display per model (default 15).
+        save_path: Optional path to save the output figure image.
+        dpi: Output image resolution (default 300).
+
+    Returns:
+        matplotlib.pyplot.Figure object.
+    """
+    if isinstance(feature_names, pd.DataFrame):
+        names = feature_names.columns.tolist()
+    else:
+        names = list(feature_names)
+
+    candidate_names: list[str] = []
+    if top_models is not None:
+        candidate_names = [m for m in top_models if m in models]
+    else:
+        preferred_order = [
+            "CatBoost",
+            "XGBoost",
+            "Random Forest",
+            "Extra Trees",
+            "Gradient Boosting",
+            "AdaBoost",
+            "Decision Tree",
+            "Logistic Regression",
+        ]
+        for name in preferred_order:
+            if name in models and len(candidate_names) < 3:
+                candidate_names.append(name)
+        if not candidate_names:
+            candidate_names = list(models.keys())[:3]
+
+    if not candidate_names:
+        fig, ax = plt.subplots(figsize=(8, 6), dpi=dpi)
+        ax.text(
+            0.5,
+            0.5,
+            "No feature importance models provided.",
+            ha="center",
+            va="center",
+        )
+        return fig
+
+    n_models = len(candidate_names)
+    fig, axes = plt.subplots(
+        1, n_models, figsize=(6.5 * n_models, 7.5), dpi=dpi, squeeze=False
+    )
+    axes_flat = axes.flatten()
+
+    palette_colors = ["#2b5c8f", "#10b981", "#c53030", "#805ad5"]
+
+    for idx, name in enumerate(candidate_names):
+        ax = axes_flat[idx]
+        model_obj = models[name]
+
+        if hasattr(model_obj, "named_steps"):
+            if "classifier" in model_obj.named_steps:
+                clf = model_obj.named_steps["classifier"]
+            elif "clf" in model_obj.named_steps:
+                clf = model_obj.named_steps["clf"]
+            else:
+                clf = model_obj
+        else:
+            clf = model_obj
+
+        if hasattr(clf, "feature_importances_"):
+            importances = np.asarray(clf.feature_importances_, dtype=float)
+        elif hasattr(clf, "get_feature_importance"):
+            importances = np.asarray(clf.get_feature_importance(), dtype=float)
+        elif hasattr(clf, "coef_"):
+            importances = np.abs(
+                clf.coef_[0] if clf.coef_.ndim > 1 else clf.coef_
+            ).astype(float)
+        else:
+            importances = np.zeros(len(names))
+
+        total_imp = np.sum(importances)
+        norm_imp = (importances / total_imp * 100.0) if total_imp > 0 else importances
+
+        imp_series = pd.Series(norm_imp, index=names).sort_values(ascending=False)
+        top_subset = imp_series.head(top_n).iloc[::-1]
+
+        y_positions = np.arange(len(top_subset))
+        bar_color = palette_colors[idx % len(palette_colors)]
+
+        bars = ax.barh(
+            y_positions,
+            top_subset.values,
+            color=bar_color,
+            alpha=0.85,
+            edgecolor="#1e293b",
+            linewidth=0.6,
+        )
+
+        ax.set_yticks(y_positions)
+        ax.set_yticklabels(top_subset.index, fontsize=9, fontweight="bold")
+        ax.set_xlabel("Relative Importance (%)", fontsize=10, fontweight="bold")
+        ax.set_title(f"{name} (Top {top_n})", fontsize=11, fontweight="bold")
+        ax.grid(axis="x", linestyle="--", alpha=0.3)
+
+        for bar in bars:
+            width = bar.get_width()
+            ax.annotate(
+                f"{width:.1f}%",
+                xy=(width, bar.get_y() + bar.get_height() / 2),
+                xytext=(4, 0),
+                textcoords="offset points",
+                ha="left",
+                va="center",
+                fontsize=8,
+                fontweight="bold",
+                color="#1e293b",
+            )
+
+        max_val = max(top_subset.values) if len(top_subset) > 0 else 1.0
+        ax.set_xlim(0, max_val * 1.25)
+
+    plt.suptitle(
+        "Top Predictive Biomarkers & Features (Leading Benchmark Ensembles)",
+        fontsize=13,
+        fontweight="bold",
+        y=0.98,
+    )
     fig.tight_layout()
 
     if save_path is not None:
